@@ -1,0 +1,89 @@
+[Unit]
+Description=certd - Self-signed certificate generation and management
+Documentation=https://github.com/krisiasty/certd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=certd
+Group=certd
+
+# Directory for certificates - default: /etc/certd
+ConfigurationDirectory=certd
+ConfigurationDirectoryMode=0750
+
+# Directory for notification files - default: /var/certd
+RuntimeDirectory=certd
+RuntimeDirectoryMode=0750
+
+# Default configuration - override any of these in a drop-in snippet:
+# /etc/systemd/system/certd.service.d/override.conf
+Environment=CERTD_ED25519=true
+Environment=CERTD_ECDSA=false
+Environment=CERTD_RSA=false
+Environment=CERTD_LIFETIME=1y
+Environment=CERTD_CERT_DIR=${CONFIGURATION_DIRECTORY}
+Environment=CERTD_NOTIFY_DIR=${RUNTIME_DIRECTORY}
+Environment=CERTD_INTERNAL_IP=true
+Environment=CERTD_EXTERNAL_IP=true
+Environment=CERTD_POLL_INTERVAL=1d
+Environment=CERTD_MAX_RETRIES=5
+
+ExecStart=/usr/local/bin/certd
+
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=30
+
+# --- Hardening ---
+
+# Prevent privilege escalation
+NoNewPrivileges=yes
+
+# Kernel security
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# Filesystem restrictions — certd only needs its own dirs and /run
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=${CONFIGURATION_DIRECTORY} ${RUNTIME_DIRECTORY}
+
+# Restrict /proc and /sys visibility
+ProcSubset=pid
+ProtectProc=invisible
+
+# Device access
+PrivateDevices=yes
+
+# Network — certd needs outbound HTTP for external IP detection
+# Remove PrivateNetwork so it can reach external IP providers and
+# the host network for internal IP detection
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# System call filtering — allow only what certd needs
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot
+SystemCallArchitectures=native
+
+# Capabilities — certd runs as unprivileged user, needs none
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Misc
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
