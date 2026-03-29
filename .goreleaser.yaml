@@ -1,0 +1,47 @@
+version: 2
+
+project_name: configd
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: .
+    binary: configd
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+
+archives:
+  - formats:
+      - binary
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+upx:
+  - enabled: true
+    compress: "3"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  abbrev: 8
+  format: "- [{{ .SHA }}](https://github.com{{ .SHA }}) {{ .Message }}"
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  prerelease: "{{ .IsV0 }}"

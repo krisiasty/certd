@@ -22,10 +22,18 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+)
+
+// set by goreleaser via -X ldflags
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
 )
 
 // algorithm represents a supported key algorithm.
@@ -548,6 +556,11 @@ func stringSlicesEqual(a, b []string) bool {
 	return true
 }
 
+func printVersion() {
+	fmt.Printf("certd %s (commit: %s, built: %s, %s)\n",
+		version, commit, date, runtime.Version())
+}
+
 // parseConfig reads CLI flags and env vars; CLI flags take precedence over env vars.
 func parseConfig() *config {
 	// Need a bootstrap logger for duration parse warnings before the main logger is set up
@@ -585,7 +598,15 @@ func parseConfig() *config {
 	flag.IntVar(&cfg.maxRetries, "max-retries", envIntOrDefault("CERTD_MAX_RETRIES", defaultMaxRetries),
 		"Max retries for external IP detection (env: CERTD_MAX_RETRIES)")
 
+	var fVersion bool
+	flag.BoolVar(&fVersion, "version", false, "print version and exit")
+
 	flag.Parse()
+
+	if fVersion {
+		printVersion()
+		os.Exit(0)
+	}
 
 	// Resolve lifetime: CLI flag overrides env var
 	cfg.lifetime = lifetimeEnv

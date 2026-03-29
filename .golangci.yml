@@ -1,0 +1,23 @@
+version: "2"
+
+linters:
+  enable:
+    - gosec
+    - errcheck
+    - unused
+    - staticcheck
+    - govet
+    - noctx
+    - ineffassign
+  settings:
+    gosec:
+      excludes:
+        # G107: url provided to HTTP request as taint input — we intentionally
+        # construct URLs from config and upstream sources, not user input
+        - G107
+        # G304: file path from variable — all paths are constructed internally,
+        # not from user input
+        - G304
+        # G204: subprocess with variable args — qemu-img paths are constructed
+        # internally from validated config, not from user input
+        - G204
