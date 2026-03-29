@@ -1,6 +1,6 @@
 version: 2
 
-project_name: configd
+project_name: certd
 
 before:
   hooks:
@@ -8,7 +8,7 @@ before:
 
 builds:
   - main: .
-    binary: configd
+    binary: certd
     ldflags:
       - -s -w
       - -X main.version={{.Version}}
