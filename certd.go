@@ -105,7 +105,7 @@ func main() {
 
 	if cfg.install {
 		if err := installEmbeddedFiles(logger); err != nil {
-			logger.Error("installation failed", "err", err)
+			logger.Error(err.Error())
 			os.Exit(1)
 		}
 		logger.Info("installation completed successfully")
@@ -600,6 +600,57 @@ func installEmbeddedFiles(logger *slog.Logger) error {
 	}
 
 	errorCount := 0
+
+	execPath, err := os.Executable()
+	if err != nil {
+		errorCount++
+		logger.Error("failed to determine executable path", "err", err)
+	} else {
+		if resolvedExecPath, evalErr := filepath.EvalSymlinks(execPath); evalErr == nil {
+			execPath = resolvedExecPath
+		}
+		const binDir = "/usr/local/bin"
+		const binPath = "/usr/local/bin/certd"
+
+		// #nosec G301 -- install mode intentionally creates world-readable system directories.
+		if err := os.MkdirAll(binDir, 0755); err != nil {
+			errorCount++
+			logger.Error("failed to create binary directory", "path", binDir, "err", err)
+		} else {
+			src, err := os.Open(execPath)
+			if err != nil {
+				errorCount++
+				logger.Error("failed to open source binary", "path", execPath, "err", err)
+			} else {
+				// #nosec G302 -- installed binary should be executable by all users.
+				dst, err := os.OpenFile(binPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+				if err != nil {
+					errorCount++
+					logger.Error("failed to open destination binary", "path", binPath, "err", err)
+					if closeErr := src.Close(); closeErr != nil {
+						errorCount++
+						logger.Error("failed to close source binary", "path", execPath, "err", closeErr)
+					}
+				} else {
+					if _, err := io.Copy(dst, src); err != nil {
+						errorCount++
+						logger.Error("failed to copy binary", "source", execPath, "target", binPath, "err", err)
+					} else {
+						logger.Info("installed binary", "source", execPath, "target", binPath)
+					}
+					if closeErr := src.Close(); closeErr != nil {
+						errorCount++
+						logger.Error("failed to close source binary", "path", execPath, "err", closeErr)
+					}
+					if closeErr := dst.Close(); closeErr != nil {
+						errorCount++
+						logger.Error("failed to close destination binary", "path", binPath, "err", closeErr)
+					}
+				}
+			}
+		}
+	}
+
 	walkErr := fs.WalkDir(contentFS, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			errorCount++
