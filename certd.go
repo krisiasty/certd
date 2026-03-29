@@ -817,7 +817,7 @@ func parseConfig() *config {
 		cfg.pollInterval = d
 	}
 
-	// Build algorithm list — default to Ed25519 if none specified
+	// Build algorithm list — default to ECDSA if none specified
 	if useRSA {
 		cfg.algorithms = append(cfg.algorithms, algorithmRSA)
 	}
@@ -828,7 +828,7 @@ func parseConfig() *config {
 		cfg.algorithms = append(cfg.algorithms, algorithmEd25519)
 	}
 	if len(cfg.algorithms) == 0 {
-		cfg.algorithms = []algorithm{algorithmEd25519}
+		cfg.algorithms = []algorithm{algorithmECDSA}
 	}
 
 	return cfg

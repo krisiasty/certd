@@ -19,8 +19,8 @@ RuntimeDirectoryMode=0750
 
 # Default configuration - override any of these in a drop-in snippet:
 # /etc/systemd/system/certd.service.d/override.conf
-Environment=CERTD_ED25519=true
-Environment=CERTD_ECDSA=false
+Environment=CERTD_ED25519=false
+Environment=CERTD_ECDSA=true
 Environment=CERTD_RSA=false
 Environment=CERTD_LIFETIME=1y
 Environment=CERTD_CERT_DIR=%S/certd
