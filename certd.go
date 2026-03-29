@@ -55,7 +55,7 @@ const (
 // certStatus holds the last known status of a single algorithm's certificate,
 // used by the HTTP health and metrics endpoints.
 type certStatus struct {
-	err       error     // non-nil if last issue/check failed
+	err       error // non-nil if last issue/check failed
 	notBefore time.Time
 	notAfter  time.Time
 	subject   string
@@ -929,47 +929,68 @@ func handleMetrics(cfg *config, store *statusStore, startTime time.Time) http.Ha
 		snapshot := store.snapshot()
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 
-		fmt.Fprintf(w, "# HELP certd_up Whether certd is running (always 1)\n")
-		fmt.Fprintf(w, "# TYPE certd_up gauge\n")
-		fmt.Fprintf(w, "certd_up 1\n\n")
+		ew := &errWriter{w: w}
 
-		fmt.Fprintf(w, "# HELP certd_start_time_seconds Unix timestamp when certd started\n")
-		fmt.Fprintf(w, "# TYPE certd_start_time_seconds gauge\n")
-		fmt.Fprintf(w, "certd_start_time_seconds %d\n\n", startTime.Unix())
+		ew.printf("# HELP certd_up Whether certd is running (always 1)\n")
+		ew.printf("# TYPE certd_up gauge\n")
+		ew.printf("certd_up 1\n\n")
 
-		fmt.Fprintf(w, "# HELP certd_cert_not_before_seconds Certificate validity start as Unix timestamp\n")
-		fmt.Fprintf(w, "# TYPE certd_cert_not_before_seconds gauge\n")
+		ew.printf("# HELP certd_start_time_seconds Unix timestamp when certd started\n")
+		ew.printf("# TYPE certd_start_time_seconds gauge\n")
+		ew.printf("certd_start_time_seconds %d\n\n", startTime.Unix())
+
+		ew.printf("# HELP certd_cert_not_before_seconds Certificate validity start as Unix timestamp\n")
+		ew.printf("# TYPE certd_cert_not_before_seconds gauge\n")
 		for _, alg := range cfg.algorithms {
 			st := snapshot[alg]
 			if !st.notBefore.IsZero() {
-				fmt.Fprintf(w, "certd_cert_not_before_seconds{algorithm=%q} %d\n", alg, st.notBefore.Unix())
+				ew.printf("certd_cert_not_before_seconds{algorithm=%q} %d\n", alg, st.notBefore.Unix())
 			}
 		}
-		fmt.Fprintln(w)
+		ew.printf("\n")
 
-		fmt.Fprintf(w, "# HELP certd_cert_not_after_seconds Certificate expiry as Unix timestamp\n")
-		fmt.Fprintf(w, "# TYPE certd_cert_not_after_seconds gauge\n")
+		ew.printf("# HELP certd_cert_not_after_seconds Certificate expiry as Unix timestamp\n")
+		ew.printf("# TYPE certd_cert_not_after_seconds gauge\n")
 		for _, alg := range cfg.algorithms {
 			st := snapshot[alg]
 			if !st.notAfter.IsZero() {
-				fmt.Fprintf(w, "certd_cert_not_after_seconds{algorithm=%q} %d\n", alg, st.notAfter.Unix())
+				ew.printf("certd_cert_not_after_seconds{algorithm=%q} %d\n", alg, st.notAfter.Unix())
 			}
 		}
-		fmt.Fprintln(w)
+		ew.printf("\n")
 
-		fmt.Fprintf(w, "# HELP certd_cert_renewals_total Total number of times a certificate was issued or renewed\n")
-		fmt.Fprintf(w, "# TYPE certd_cert_renewals_total counter\n")
+		ew.printf("# HELP certd_cert_renewals_total Total number of times a certificate was issued or renewed\n")
+		ew.printf("# TYPE certd_cert_renewals_total counter\n")
 		for _, alg := range cfg.algorithms {
-			fmt.Fprintf(w, "certd_cert_renewals_total{algorithm=%q} %d\n", alg, snapshot[alg].renewals)
+			ew.printf("certd_cert_renewals_total{algorithm=%q} %d\n", alg, snapshot[alg].renewals)
 		}
-		fmt.Fprintln(w)
+		ew.printf("\n")
 
-		fmt.Fprintf(w, "# HELP certd_cert_errors_total Total number of failed certificate issue attempts\n")
-		fmt.Fprintf(w, "# TYPE certd_cert_errors_total counter\n")
+		ew.printf("# HELP certd_cert_errors_total Total number of failed certificate issue attempts\n")
+		ew.printf("# TYPE certd_cert_errors_total counter\n")
 		for _, alg := range cfg.algorithms {
-			fmt.Fprintf(w, "certd_cert_errors_total{algorithm=%q} %d\n", alg, snapshot[alg].errors)
+			ew.printf("certd_cert_errors_total{algorithm=%q} %d\n", alg, snapshot[alg].errors)
 		}
+
+		// Writes to http.ResponseWriter rarely fail (client disconnect), nothing to do
+		// beyond letting the connection close naturally — but errcheck requires we
+		// acknowledge the error.
+		_ = ew.err
 	}
+}
+
+// errWriter wraps an io.Writer and tracks the first write error,
+// allowing subsequent writes to be skipped silently.
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (ew *errWriter) printf(format string, args ...any) {
+	if ew.err != nil {
+		return
+	}
+	_, ew.err = fmt.Fprintf(ew.w, format, args...)
 }
 
 // parseConfig reads CLI flags and env vars; CLI flags take precedence over env vars.
