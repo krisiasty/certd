@@ -226,7 +226,7 @@ func checkOne(
 			return err
 		}
 		updateState(st, hostname, internalIPs, externalIP)
-		return touchNotifyFile(paths.notify)
+		return touchNotifyFile(logger, paths.notify)
 	}
 
 	// Parse existing cert
@@ -237,7 +237,7 @@ func checkOne(
 			return err
 		}
 		updateState(st, hostname, internalIPs, externalIP)
-		return touchNotifyFile(paths.notify)
+		return touchNotifyFile(logger, paths.notify)
 	}
 
 	// Case 2: hostname changed
@@ -247,7 +247,7 @@ func checkOne(
 			return err
 		}
 		updateState(st, hostname, internalIPs, externalIP)
-		return touchNotifyFile(paths.notify)
+		return touchNotifyFile(logger, paths.notify)
 	}
 
 	// Case 3: internal IPs changed
@@ -257,7 +257,7 @@ func checkOne(
 			return err
 		}
 		updateState(st, hostname, internalIPs, externalIP)
-		return touchNotifyFile(paths.notify)
+		return touchNotifyFile(logger, paths.notify)
 	}
 
 	// Case 4: external IP changed
@@ -267,7 +267,7 @@ func checkOne(
 			return err
 		}
 		updateState(st, hostname, internalIPs, externalIP)
-		return touchNotifyFile(paths.notify)
+		return touchNotifyFile(logger, paths.notify)
 	}
 
 	// Case 5: renewal due
@@ -280,7 +280,7 @@ func checkOne(
 			return err
 		}
 		updateState(st, hostname, internalIPs, externalIP)
-		return touchNotifyFile(paths.notify)
+		return touchNotifyFile(logger, paths.notify)
 	}
 
 	// No action needed — update state on first successful poll
@@ -547,7 +547,7 @@ func loadCert(path string) (*x509.Certificate, error) {
 }
 
 // touchNotifyFile creates or updates the mtime of the per-algorithm notification file.
-func touchNotifyFile(path string) error {
+func touchNotifyFile(logger *slog.Logger, path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
 		return fmt.Errorf("creating notify dir: %w", err)
 	}
@@ -555,7 +555,11 @@ func touchNotifyFile(path string) error {
 	if err != nil {
 		return fmt.Errorf("touching notify file: %w", err)
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
+	logger.Info("touched notify file", "path", path)
+	return nil
 }
 
 func fileExists(path string) bool {
