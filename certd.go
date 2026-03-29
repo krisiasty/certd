@@ -611,11 +611,17 @@ func installEmbeddedFiles(logger *slog.Logger) error {
 		}
 		const binDir = "/usr/local/bin"
 		const binPath = "/usr/local/bin/certd"
+		resolvedBinPath := binPath
+		if rp, evalErr := filepath.EvalSymlinks(binPath); evalErr == nil {
+			resolvedBinPath = rp
+		}
 
 		// #nosec G301 -- install mode intentionally creates world-readable system directories.
 		if err := os.MkdirAll(binDir, 0755); err != nil {
 			errorCount++
 			logger.Error("failed to create binary directory", "path", binDir, "err", err)
+		} else if execPath == resolvedBinPath {
+			logger.Info("source binary already matches destination, skipping binary copy", "path", binPath)
 		} else {
 			src, err := os.Open(execPath)
 			if err != nil {
