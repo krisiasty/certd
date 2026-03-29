@@ -310,10 +310,10 @@ func issueCert(
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	if err := os.WriteFile(paths.cert, certPEM, 0640); err != nil {
+	if err := os.WriteFile(paths.cert, certPEM, 0640); err != nil { //#nosec G306
 		return fmt.Errorf("writing cert file: %w", err)
 	}
-	if err := os.WriteFile(paths.key, keyPEM, 0640); err != nil {
+	if err := os.WriteFile(paths.key, keyPEM, 0640); err != nil { //#nosec G306
 		return fmt.Errorf("writing key file: %w", err)
 	}
 
@@ -524,7 +524,7 @@ func loadCert(path string) (*x509.Certificate, error) {
 
 // touchNotifyFile creates or updates the mtime of the per-algorithm notification file.
 func touchNotifyFile(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
 		return fmt.Errorf("creating notify dir: %w", err)
 	}
 	f, err := os.Create(path)
