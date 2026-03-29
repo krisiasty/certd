@@ -486,7 +486,8 @@ func getExternalIP(ctx context.Context) (string, error) {
 			continue
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
-		resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: reading response: %w", provider, err))
 			continue
