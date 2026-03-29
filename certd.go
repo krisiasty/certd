@@ -52,8 +52,8 @@ const (
 
 // certPaths holds the file paths for a single algorithm's cert and key.
 type certPaths struct {
-	cert   string // e.g. /etc/configd/tls/server_rsa.crt
-	key    string // e.g. /etc/configd/tls/server_rsa.key
+	cert   string // e.g. /var/lib/certd/tls/server_rsa.crt
+	key    string // e.g. /var/lib/certd/tls/server_rsa.key
 	notify string // e.g. /run/certd/cert-updated-rsa
 }
 
