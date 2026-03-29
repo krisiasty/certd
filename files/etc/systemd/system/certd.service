@@ -30,6 +30,9 @@ Environment=CERTD_EXTERNAL_IP=true
 Environment=CERTD_POLL_INTERVAL=1d
 Environment=CERTD_MAX_RETRIES=5
 
+# limit the number of OS threads used
+Environment=GOMAXPROCS=1
+
 ExecStart=/usr/local/bin/certd
 
 Restart=on-failure
