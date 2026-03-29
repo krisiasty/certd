@@ -312,3 +312,7 @@ scanning, and static code analysis on every commit.
 
 That said, this software is provided as-is with no guarantees. It may contain
 bugs. **Use at your own risk.**
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
