@@ -23,8 +23,8 @@ Environment=CERTD_ED25519=true
 Environment=CERTD_ECDSA=false
 Environment=CERTD_RSA=false
 Environment=CERTD_LIFETIME=1y
-Environment=CERTD_CERT_DIR=${STATE_DIRECTORY}
-Environment=CERTD_NOTIFY_DIR=${RUNTIME_DIRECTORY}
+Environment=CERTD_CERT_DIR=%S/certd
+Environment=CERTD_NOTIFY_DIR=%t/certd
 Environment=CERTD_INTERNAL_IP=true
 Environment=CERTD_EXTERNAL_IP=true
 Environment=CERTD_POLL_INTERVAL=1d
