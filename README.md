@@ -31,6 +31,12 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now certd
 ```
 
+> [!NOTE]
+> `certd` creates and uses user and group named `certd`.
+> Make sure there is no conflict with other programs.
+> If needed, create different user and group then adjust settings in systemd unit.
+> Remember to also reload systemd after making these changes.
+
 ## Configuration
 
 All configuration is done via environment variables. The systemd unit sets sensible defaults for all options
