@@ -64,7 +64,7 @@ PrivateDevices=yes
 # Network — certd needs outbound HTTP for external IP detection
 # Remove PrivateNetwork so it can reach external IP providers and
 # the host network for internal IP detection
-RestrictAddressFamilies=AF_INET AF_INET6
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
 
 # System call filtering — allow only what certd needs
 SystemCallFilter=@system-service
