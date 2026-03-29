@@ -9,11 +9,11 @@ Type=simple
 User=certd
 Group=certd
 
-# Directory for certificates - default: /etc/certd
-ConfigurationDirectory=certd
-ConfigurationDirectoryMode=0750
+# Directory for certificates - default: /var/lib/certd
+StateDirectory=certd
+StateDirectoryMode=0750
 
-# Directory for notification files - default: /var/certd
+# Directory for notification files - default: /run/certd
 RuntimeDirectory=certd
 RuntimeDirectoryMode=0750
 
@@ -23,7 +23,7 @@ Environment=CERTD_ED25519=true
 Environment=CERTD_ECDSA=false
 Environment=CERTD_RSA=false
 Environment=CERTD_LIFETIME=1y
-Environment=CERTD_CERT_DIR=${CONFIGURATION_DIRECTORY}
+Environment=CERTD_CERT_DIR=${STATE_DIRECTORY}
 Environment=CERTD_NOTIFY_DIR=${RUNTIME_DIRECTORY}
 Environment=CERTD_INTERNAL_IP=true
 Environment=CERTD_EXTERNAL_IP=true
@@ -53,7 +53,6 @@ ProtectHostname=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=${CONFIGURATION_DIRECTORY} ${RUNTIME_DIRECTORY}
 
 # Restrict /proc and /sys visibility
 ProcSubset=pid

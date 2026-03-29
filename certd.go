@@ -79,7 +79,7 @@ type config struct {
 }
 
 const (
-	defaultCertDir      = "/etc/certd"
+	defaultCertDir      = "/var/lib/certd"
 	defaultNotifyDir    = "/run/certd"
 	defaultPollInterval = 1 * time.Hour
 	defaultMaxRetries   = 5
