@@ -337,7 +337,7 @@ func checkOne(
 	cert, err := loadCert(paths.cert)
 	if err != nil {
 		logger.Warn("failed to parse existing certificate, re-issuing", "err", err)
-		return issueAndNotify("unparseable")
+		return issueAndNotify("unparsable")
 	}
 
 	// Update store with current cert state
