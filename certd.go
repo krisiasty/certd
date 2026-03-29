@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"embed"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -27,6 +28,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -49,6 +51,73 @@ const (
 	algorithmECDSA   algorithm = "ecdsa"
 	algorithmEd25519 algorithm = "ed25519"
 )
+
+// certStatus holds the last known status of a single algorithm's certificate,
+// used by the HTTP health and metrics endpoints.
+type certStatus struct {
+	err       error     // non-nil if last issue/check failed
+	notBefore time.Time
+	notAfter  time.Time
+	subject   string
+	dnsNames  []string
+	ipAddrs   []string
+	renewals  int64 // total number of times cert was issued/renewed
+	errors    int64 // total number of failed issue attempts
+}
+
+// statusStore is a thread-safe store of per-algorithm certificate status.
+type statusStore struct {
+	mu       sync.RWMutex
+	statuses map[algorithm]*certStatus
+}
+
+func newStatusStore(algorithms []algorithm) *statusStore {
+	s := &statusStore{statuses: make(map[algorithm]*certStatus, len(algorithms))}
+	for _, alg := range algorithms {
+		s.statuses[alg] = &certStatus{}
+	}
+	return s
+}
+
+func (s *statusStore) setOK(alg algorithm, cert *x509.Certificate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.statuses[alg]
+	st.err = nil
+	st.notBefore = cert.NotBefore
+	st.notAfter = cert.NotAfter
+	st.subject = cert.Subject.CommonName
+	st.dnsNames = cert.DNSNames
+	ipAddrs := make([]string, len(cert.IPAddresses))
+	for i, ip := range cert.IPAddresses {
+		ipAddrs[i] = ip.String()
+	}
+	st.ipAddrs = ipAddrs
+}
+
+func (s *statusStore) recordRenewal(alg algorithm) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statuses[alg].renewals++
+}
+
+func (s *statusStore) recordError(alg algorithm, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.statuses[alg]
+	st.err = err
+	st.errors++
+}
+
+func (s *statusStore) snapshot() map[algorithm]certStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[algorithm]certStatus, len(s.statuses))
+	for alg, st := range s.statuses {
+		out[alg] = *st
+	}
+	return out
+}
 
 // certPaths holds the file paths for a single algorithm's cert and key.
 type certPaths struct {
@@ -74,6 +143,7 @@ type config struct {
 	externalIP   bool
 	pollInterval time.Duration
 	maxRetries   int
+	httpAddr     string
 	install      bool
 	version      bool
 }
@@ -84,7 +154,8 @@ const (
 	defaultPollInterval = 1 * time.Hour
 	defaultMaxRetries   = 5
 	defaultLifetime     = 8760 * time.Hour // 1 year
-	renewThreshold      = 1.0 / 3.0        // renew when less than 1/3 of lifetime remains
+	defaultHTTPAddr     = "127.0.0.1:8484"
+	renewThreshold      = 1.0 / 3.0 // renew when less than 1/3 of lifetime remains
 )
 
 var externalIPProviders = []string{
@@ -135,7 +206,29 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 		"externalIP", cfg.externalIP,
 		"pollInterval", cfg.pollInterval,
 		"maxRetries", cfg.maxRetries,
+		"httpAddr", cfg.httpAddr,
 	)
+
+	store := newStatusStore(cfg.algorithms)
+	startTime := time.Now()
+
+	// Start HTTP server if configured
+	if cfg.httpAddr != "" {
+		srv := newHTTPServer(cfg, store, startTime, logger)
+		go func() {
+			logger.Info("starting HTTP server", "addr", cfg.httpAddr)
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("HTTP server error", "err", err)
+			}
+		}()
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(shutdownCtx); err != nil {
+				logger.Warn("HTTP server shutdown error", "err", err)
+			}
+		}()
+	}
 
 	// Initialise per-algorithm state
 	states := make(map[algorithm]*certState, len(cfg.algorithms))
@@ -144,7 +237,7 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 	}
 
 	// Run an immediate check before entering the poll loop
-	if err := checkAll(ctx, cfg, logger, states); err != nil {
+	if err := checkAll(ctx, cfg, logger, states, store); err != nil {
 		return err
 	}
 
@@ -157,7 +250,7 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 			logger.Info("shutting down")
 			return ctx.Err()
 		case <-ticker.C:
-			if err := checkAll(ctx, cfg, logger, states); err != nil {
+			if err := checkAll(ctx, cfg, logger, states, store); err != nil {
 				return err
 			}
 		}
@@ -165,7 +258,7 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 }
 
 // checkAll runs a poll cycle for every enabled algorithm independently.
-func checkAll(ctx context.Context, cfg *config, logger *slog.Logger, states map[algorithm]*certState) error {
+func checkAll(ctx context.Context, cfg *config, logger *slog.Logger, states map[algorithm]*certState, store *statusStore) error {
 	// Gather host info once — shared across all algorithms in this cycle
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -200,7 +293,8 @@ func checkAll(ctx context.Context, cfg *config, logger *slog.Logger, states map[
 		st := states[alg]
 		algLogger := logger.With("algorithm", alg)
 
-		if err := checkOne(algLogger, cfg, alg, paths, st, hostname, internalIPs, externalIP); err != nil {
+		if err := checkOne(algLogger, cfg, alg, paths, st, store, hostname, internalIPs, externalIP); err != nil {
+			store.recordError(alg, err)
 			algLogger.Error("failed to process certificate, will retry next poll", "err", err)
 		}
 	}
@@ -215,72 +309,65 @@ func checkOne(
 	alg algorithm,
 	paths certPaths,
 	st *certState,
+	store *statusStore,
 	hostname string,
 	internalIPs []string,
 	externalIP string,
 ) error {
-	// Case 1: cert or key missing
-	if !fileExists(paths.cert) || !fileExists(paths.key) {
-		logger.Info("certificate not found, issuing")
+	issueAndNotify := func(reason string) error {
+		logger.Info("issuing certificate", "reason", reason)
 		if err := issueCert(logger, cfg, alg, paths, hostname, internalIPs, externalIP); err != nil {
 			return err
 		}
+		store.recordRenewal(alg)
 		updateState(st, hostname, internalIPs, externalIP)
+		// Update status from freshly written cert
+		if cert, err := loadCert(paths.cert); err == nil {
+			store.setOK(alg, cert)
+		}
 		return touchNotifyFile(logger, paths.notify)
+	}
+
+	// Case 1: cert or key missing
+	if !fileExists(paths.cert) || !fileExists(paths.key) {
+		return issueAndNotify("missing")
 	}
 
 	// Parse existing cert
 	cert, err := loadCert(paths.cert)
 	if err != nil {
 		logger.Warn("failed to parse existing certificate, re-issuing", "err", err)
-		if err := issueCert(logger, cfg, alg, paths, hostname, internalIPs, externalIP); err != nil {
-			return err
-		}
-		updateState(st, hostname, internalIPs, externalIP)
-		return touchNotifyFile(logger, paths.notify)
+		return issueAndNotify("unparseable")
 	}
+
+	// Update store with current cert state
+	store.setOK(alg, cert)
 
 	// Case 2: hostname changed
 	if st.hostname != "" && hostname != st.hostname {
-		logger.Info("hostname changed, re-issuing", "old", st.hostname, "new", hostname)
-		if err := issueCert(logger, cfg, alg, paths, hostname, internalIPs, externalIP); err != nil {
-			return err
-		}
-		updateState(st, hostname, internalIPs, externalIP)
-		return touchNotifyFile(logger, paths.notify)
+		logger.Info("hostname changed", "old", st.hostname, "new", hostname)
+		return issueAndNotify("hostname changed")
 	}
 
 	// Case 3: internal IPs changed
 	if cfg.internalIP && st.hostname != "" && !stringSlicesEqual(internalIPs, st.internalIPs) {
-		logger.Info("internal IPs changed, re-issuing", "old", st.internalIPs, "new", internalIPs)
-		if err := issueCert(logger, cfg, alg, paths, hostname, internalIPs, externalIP); err != nil {
-			return err
-		}
-		updateState(st, hostname, internalIPs, externalIP)
-		return touchNotifyFile(logger, paths.notify)
+		logger.Info("internal IPs changed", "old", st.internalIPs, "new", internalIPs)
+		return issueAndNotify("internal IPs changed")
 	}
 
 	// Case 4: external IP changed
 	if cfg.externalIP && st.externalIP != "" && externalIP != "" && externalIP != st.externalIP {
-		logger.Info("external IP changed, re-issuing", "old", st.externalIP, "new", externalIP)
-		if err := issueCert(logger, cfg, alg, paths, hostname, internalIPs, externalIP); err != nil {
-			return err
-		}
-		updateState(st, hostname, internalIPs, externalIP)
-		return touchNotifyFile(logger, paths.notify)
+		logger.Info("external IP changed", "old", st.externalIP, "new", externalIP)
+		return issueAndNotify("external IP changed")
 	}
 
 	// Case 5: renewal due
 	if needsRenewal(cert, renewThreshold) {
-		logger.Info("certificate due for renewal",
+		logger.Info("certificate approaching expiry",
 			"notAfter", cert.NotAfter,
 			"remaining", time.Until(cert.NotAfter).Round(time.Hour),
 		)
-		if err := issueCert(logger, cfg, alg, paths, hostname, internalIPs, externalIP); err != nil {
-			return err
-		}
-		updateState(st, hostname, internalIPs, externalIP)
-		return touchNotifyFile(logger, paths.notify)
+		return issueAndNotify("renewal due")
 	}
 
 	// No action needed — update state on first successful poll
@@ -753,6 +840,138 @@ func installEmbeddedFiles(logger *slog.Logger) error {
 	return nil
 }
 
+// newHTTPServer creates the HTTP server with /health and /metrics endpoints.
+func newHTTPServer(cfg *config, store *statusStore, startTime time.Time, logger *slog.Logger) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", handleHealth(cfg, store, logger))
+	mux.HandleFunc("/metrics", handleMetrics(cfg, store, startTime))
+	return &http.Server{
+		Addr:         cfg.httpAddr,
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+		IdleTimeout:  30 * time.Second,
+	}
+}
+
+// handleHealth returns a handler for the /health endpoint.
+// Returns 200 if all certs are healthy, 503 if any have errors.
+func handleHealth(cfg *config, store *statusStore, logger *slog.Logger) http.HandlerFunc {
+	type certHealth struct {
+		Status    string   `json:"status"`
+		Error     string   `json:"error,omitempty"`
+		Subject   string   `json:"subject,omitempty"`
+		NotBefore string   `json:"not_before,omitempty"`
+		NotAfter  string   `json:"not_after,omitempty"`
+		Remaining string   `json:"remaining,omitempty"`
+		SANDNS    []string `json:"san_dns,omitempty"`
+		SANIP     []string `json:"san_ip,omitempty"`
+	}
+	type response struct {
+		Status string                `json:"status"`
+		Certs  map[string]certHealth `json:"certs"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		snapshot := store.snapshot()
+		certs := make(map[string]certHealth, len(cfg.algorithms))
+		allOK := true
+
+		for _, alg := range cfg.algorithms {
+			st := snapshot[alg]
+			if st.err != nil || st.notAfter.IsZero() {
+				allOK = false
+				errMsg := "certificate not yet issued"
+				if st.err != nil {
+					errMsg = st.err.Error()
+				}
+				certs[string(alg)] = certHealth{Status: "error", Error: errMsg}
+				continue
+			}
+			remaining := time.Until(st.notAfter)
+			ch := certHealth{
+				Status:    "ok",
+				Subject:   st.subject,
+				NotBefore: st.notBefore.UTC().Format(time.RFC3339),
+				NotAfter:  st.notAfter.UTC().Format(time.RFC3339),
+				Remaining: remaining.Round(time.Hour).String(),
+				SANDNS:    st.dnsNames,
+				SANIP:     st.ipAddrs,
+			}
+			if remaining <= 0 {
+				allOK = false
+				ch.Status = "expired"
+			}
+			certs[string(alg)] = ch
+		}
+
+		resp := response{
+			Status: "ok",
+			Certs:  certs,
+		}
+		if !allOK {
+			resp.Status = "error"
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if !allOK {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			logger.Warn("failed to write health response", "err", err)
+		}
+	}
+}
+
+// handleMetrics returns a handler for the /metrics endpoint (Prometheus text format).
+func handleMetrics(cfg *config, store *statusStore, startTime time.Time) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		snapshot := store.snapshot()
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+
+		fmt.Fprintf(w, "# HELP certd_up Whether certd is running (always 1)\n")
+		fmt.Fprintf(w, "# TYPE certd_up gauge\n")
+		fmt.Fprintf(w, "certd_up 1\n\n")
+
+		fmt.Fprintf(w, "# HELP certd_start_time_seconds Unix timestamp when certd started\n")
+		fmt.Fprintf(w, "# TYPE certd_start_time_seconds gauge\n")
+		fmt.Fprintf(w, "certd_start_time_seconds %d\n\n", startTime.Unix())
+
+		fmt.Fprintf(w, "# HELP certd_cert_not_before_seconds Certificate validity start as Unix timestamp\n")
+		fmt.Fprintf(w, "# TYPE certd_cert_not_before_seconds gauge\n")
+		for _, alg := range cfg.algorithms {
+			st := snapshot[alg]
+			if !st.notBefore.IsZero() {
+				fmt.Fprintf(w, "certd_cert_not_before_seconds{algorithm=%q} %d\n", alg, st.notBefore.Unix())
+			}
+		}
+		fmt.Fprintln(w)
+
+		fmt.Fprintf(w, "# HELP certd_cert_not_after_seconds Certificate expiry as Unix timestamp\n")
+		fmt.Fprintf(w, "# TYPE certd_cert_not_after_seconds gauge\n")
+		for _, alg := range cfg.algorithms {
+			st := snapshot[alg]
+			if !st.notAfter.IsZero() {
+				fmt.Fprintf(w, "certd_cert_not_after_seconds{algorithm=%q} %d\n", alg, st.notAfter.Unix())
+			}
+		}
+		fmt.Fprintln(w)
+
+		fmt.Fprintf(w, "# HELP certd_cert_renewals_total Total number of times a certificate was issued or renewed\n")
+		fmt.Fprintf(w, "# TYPE certd_cert_renewals_total counter\n")
+		for _, alg := range cfg.algorithms {
+			fmt.Fprintf(w, "certd_cert_renewals_total{algorithm=%q} %d\n", alg, snapshot[alg].renewals)
+		}
+		fmt.Fprintln(w)
+
+		fmt.Fprintf(w, "# HELP certd_cert_errors_total Total number of failed certificate issue attempts\n")
+		fmt.Fprintf(w, "# TYPE certd_cert_errors_total counter\n")
+		for _, alg := range cfg.algorithms {
+			fmt.Fprintf(w, "certd_cert_errors_total{algorithm=%q} %d\n", alg, snapshot[alg].errors)
+		}
+	}
+}
+
 // parseConfig reads CLI flags and env vars; CLI flags take precedence over env vars.
 func parseConfig() *config {
 	// Need a bootstrap logger for duration parse warnings before the main logger is set up
@@ -789,6 +1008,8 @@ func parseConfig() *config {
 		"Include external IP in certificate SANs (env: CERTD_EXTERNAL_IP)")
 	flag.IntVar(&cfg.maxRetries, "max-retries", envIntOrDefault("CERTD_MAX_RETRIES", defaultMaxRetries),
 		"Max retries for external IP detection (env: CERTD_MAX_RETRIES)")
+	flag.StringVar(&cfg.httpAddr, "http-addr", envOrDefault("CERTD_HTTP_ADDR", defaultHTTPAddr),
+		"Address for HTTP health/metrics server, empty string to disable (env: CERTD_HTTP_ADDR)")
 	flag.BoolVar(&cfg.install, "install", false, "Install embedded files to host paths and exit (requires root)")
 	flag.BoolVar(&cfg.version, "version", false, "print version and exit")
 
