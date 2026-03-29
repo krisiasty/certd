@@ -9,11 +9,13 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"embed"
 	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"math/big"
 	"net"
@@ -35,6 +37,9 @@ var (
 	commit  = "none"
 	date    = "unknown"
 )
+
+var errInstallationFailed = errors.New("installation failed")
+var errExternalIPCheckFailed = errors.New("unable to check external IP using any provider")
 
 // algorithm represents a supported key algorithm.
 type algorithm string
@@ -69,6 +74,8 @@ type config struct {
 	externalIP   bool
 	pollInterval time.Duration
 	maxRetries   int
+	install      bool
+	version      bool
 }
 
 const (
@@ -86,12 +93,24 @@ var externalIPProviders = []string{
 	"https://ifconfig.io/ip",
 }
 
+//go:embed files/**
+var embeddedFiles embed.FS
+
 func main() {
 	cfg := parseConfig()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
+
+	if cfg.install {
+		if err := installEmbeddedFiles(logger); err != nil {
+			logger.Error("installation failed", "err", err)
+			os.Exit(1)
+		}
+		logger.Info("installation completed successfully")
+		return
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -449,7 +468,7 @@ func getExternalIPWithRetry(ctx context.Context, maxRetries int, logger *slog.Lo
 	backoff := time.Second
 	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		ip, err := getExternalIP(ctx)
+		ip, err := getExternalIP(ctx, logger)
 		if err == nil {
 			return ip, nil
 		}
@@ -471,35 +490,40 @@ func getExternalIPWithRetry(ctx context.Context, maxRetries int, logger *slog.Lo
 }
 
 // getExternalIP tries each provider in order, returning the first valid IPv4 response.
-func getExternalIP(ctx context.Context) (string, error) {
+func getExternalIP(ctx context.Context, logger *slog.Logger) (string, error) {
 	client := &http.Client{Timeout: 5 * time.Second}
-	var errs []error
 	for _, provider := range externalIPProviders {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, provider, nil)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", provider, err))
+			logger.Warn("external IP provider request creation failed", "provider", provider, "err", err)
 			continue
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", provider, err))
+			logger.Warn("external IP provider request failed", "provider", provider, "err", err)
 			continue
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
+		closeErr := resp.Body.Close()
 		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: reading response: %w", provider, err))
+			logger.Warn("external IP provider response read failed", "provider", provider, "err", err)
+			if closeErr != nil {
+				logger.Warn("external IP provider response body close failed", "provider", provider, "err", closeErr)
+			}
+			continue
+		}
+		if closeErr != nil {
+			logger.Warn("external IP provider response body close failed", "provider", provider, "err", closeErr)
 			continue
 		}
 		ip := strings.TrimSpace(string(body))
 		if parsed := net.ParseIP(ip); parsed == nil || parsed.To4() == nil {
-			errs = append(errs, fmt.Errorf("%s: invalid IPv4 in response: %q", provider, ip))
+			logger.Warn("external IP provider returned invalid IPv4", "provider", provider, "response", ip)
 			continue
 		}
 		return ip, nil
 	}
-	return "", fmt.Errorf("all providers failed: %w", errors.Join(errs...))
+	return "", errExternalIPCheckFailed
 }
 
 // needsRenewal returns true when less than threshold fraction of lifetime remains.
@@ -562,6 +586,112 @@ func printVersion() {
 		version, commit, date, runtime.Version())
 }
 
+//nolint:gosec // install mode writes intentional system paths and file modes from embedded, trusted assets.
+func installEmbeddedFiles(logger *slog.Logger) error {
+	if os.Geteuid() != 0 {
+		logger.Error("installation requires root privileges")
+		return errInstallationFailed
+	}
+
+	contentFS, err := fs.Sub(embeddedFiles, "files")
+	if err != nil {
+		logger.Error("failed to prepare embedded files", "err", err)
+		return errInstallationFailed
+	}
+
+	errorCount := 0
+	walkErr := fs.WalkDir(contentFS, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			errorCount++
+			logger.Error("failed to access embedded entry", "path", path, "err", err)
+			return nil
+		}
+		if path == "." {
+			return nil
+		}
+
+		targetPath := string(os.PathSeparator) + filepath.Clean(path)
+
+		if d.IsDir() {
+			// #nosec G301 -- install mode intentionally creates world-readable system directories.
+			// #nosec G122 -- source paths come from compile-time embedded assets, not user input.
+			if err := os.MkdirAll(targetPath, 0755); err != nil {
+				errorCount++
+				logger.Error("failed to create directory", "path", targetPath, "err", err)
+			}
+			return nil
+		}
+
+		// #nosec G301 -- install mode intentionally creates world-readable system directories.
+		// #nosec G122 -- source paths come from compile-time embedded assets, not user input.
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			errorCount++
+			logger.Error("failed to create parent directory", "path", filepath.Dir(targetPath), "err", err)
+			return nil
+		}
+
+		src, err := contentFS.Open(path)
+		if err != nil {
+			errorCount++
+			logger.Error("failed to read embedded file", "path", path, "err", err)
+			return nil
+		}
+
+		// #nosec G302 -- installed service/config files are expected to be world-readable.
+		// #nosec G122 -- source paths come from compile-time embedded assets, not user input.
+		f, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			errorCount++
+			logger.Error("failed to open destination file", "path", targetPath, "err", err)
+			if closeErr := src.Close(); closeErr != nil {
+				errorCount++
+				logger.Error("failed to close embedded file", "path", path, "err", closeErr)
+			}
+			return nil
+		}
+		if _, err := io.Copy(f, src); err != nil {
+			errorCount++
+			logger.Error("failed to copy file content", "path", targetPath, "err", err)
+			if closeErr := src.Close(); closeErr != nil {
+				errorCount++
+				logger.Error("failed to close embedded file", "path", path, "err", closeErr)
+			}
+			if closeErr := f.Close(); closeErr != nil {
+				errorCount++
+				logger.Error("failed to close destination file", "path", targetPath, "err", closeErr)
+			}
+			return nil
+		}
+		if err := src.Close(); err != nil {
+			errorCount++
+			logger.Error("failed to close embedded file", "path", path, "err", err)
+			if closeErr := f.Close(); closeErr != nil {
+				errorCount++
+				logger.Error("failed to close destination file", "path", targetPath, "err", closeErr)
+			}
+			return nil
+		}
+		if err := f.Close(); err != nil {
+			errorCount++
+			logger.Error("failed to close destination file", "path", targetPath, "err", err)
+			return nil
+		}
+
+		logger.Info("installed file", "source", path, "target", targetPath)
+		return nil
+	})
+	if walkErr != nil {
+		errorCount++
+		logger.Error("failed to walk embedded files", "err", walkErr)
+	}
+
+	if errorCount > 0 {
+		logger.Error("installation completed with errors", "errorCount", errorCount)
+		return errInstallationFailed
+	}
+	return nil
+}
+
 // parseConfig reads CLI flags and env vars; CLI flags take precedence over env vars.
 func parseConfig() *config {
 	// Need a bootstrap logger for duration parse warnings before the main logger is set up
@@ -598,13 +728,12 @@ func parseConfig() *config {
 		"Include external IP in certificate SANs (env: CERTD_EXTERNAL_IP)")
 	flag.IntVar(&cfg.maxRetries, "max-retries", envIntOrDefault("CERTD_MAX_RETRIES", defaultMaxRetries),
 		"Max retries for external IP detection (env: CERTD_MAX_RETRIES)")
-
-	var fVersion bool
-	flag.BoolVar(&fVersion, "version", false, "print version and exit")
+	flag.BoolVar(&cfg.install, "install", false, "Install embedded files to host paths and exit (requires root)")
+	flag.BoolVar(&cfg.version, "version", false, "print version and exit")
 
 	flag.Parse()
 
-	if fVersion {
+	if cfg.version {
 		printVersion()
 		os.Exit(0)
 	}
