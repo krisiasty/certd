@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for certd rsa certificate update (%i)
+After=certd.service
+BindsTo=certd.service
+
+[Path]
+PathChanged=%t/certd/cert-updated-rsa
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart %i after certd rsa certificate update
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl try-restart %i

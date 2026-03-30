@@ -145,55 +145,40 @@ via `RuntimeDirectory=certd`. On first boot the files do not exist;
 
 ### Setting up a dependent service
 
-Create a `.path` unit that watches the relevant notification file and a companion `.service` unit that restarts
-the dependent service. Both are template units using `%i` as the instance name.
+`certd -install` creates additional systemd `.path` units that watches the relevant notification file
+and a companion `.service` units that restarts the dependent service.
+Both are template units using `%i` as the instance name.
 
-**`/etc/systemd/system/certd-notify@.path`**
+There is a separate pair of `.path` and `.service` for each algorithm:
 
-```ini
-[Unit]
-Description=Watch for certd certificate update (%i)
-After=certd.service
-BindsTo=certd.service
+- `certd-notify-ecdsa@.path` and `certd-notify-ecdsa@.service` for **ECDSA**
+- `certd-notify-ed25519@.path` and `certd-notify-ed25519@.service` for **Ed25519**
+- `certd-notify-rsa@.path` and `certd-notify-rsa@.service` for **RSA**
 
-[Path]
-PathChanged=/run/certd/cert-updated-%i
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**`/etc/systemd/system/certd-notify@.service`**
-
-```ini
-[Unit]
-Description=Restart %i after certd certificate update
-
-[Service]
-Type=oneshot
-ExecStart=systemctl try-restart %i
-```
-
-Enable the path unit for each service that uses a certificate, substituting the algorithm name as the instance:
+Enable the path unit for each service that uses a certificate, substituting the service name as the instance:
 
 ```sh
-# For a service using the ECDSA certificate
-sudo systemctl enable --now certd-notify@myservice-ecdsa.path
+# For a service configd using the ECDSA certificate
+sudo systemctl enable --now certd-notify-ecdsa@configd.path
+
+# Another example - nginx service using RSA certificate
+sudo systemctl enable --now certd-notify-rsa@nginx.path
 ```
 
-If a service uses a different algorithm, create a drop-in to override the watched file:
-
-**`/etc/systemd/system/certd-notify@myservice-rsa.path.d/override.conf`**
-
-```ini
-[Path]
-PathChanged=/run/certd/cert-updated-rsa
-```
-
-Then enable:
+To list defined watchers, use:
 
 ```sh
-sudo systemctl enable --now certd-notify@myservice-rsa.path
+systemctl list-units --type=path "certd-notify-*"
+
+  UNIT                            LOAD   ACTIVE SUB     DESCRIPTION
+  certd-notify-ecdsa@configd.path loaded active waiting Watch for certd ecdsa certificate update (configd)
+
+Legend: LOAD   → Reflects whether the unit definition was properly loaded.
+        ACTIVE → The high-level unit activation state, i.e. generalization of SUB.
+        SUB    → The low-level unit activation state, values depend on unit type.
+
+1 loaded units listed. Pass --all to see loaded but inactive units, too.
+To show all installed unit files use 'systemctl list-unit-files'.
 ```
 
 ### Ordering: ensuring the certificate exists before the dependent service starts

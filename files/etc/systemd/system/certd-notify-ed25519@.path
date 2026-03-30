@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for certd ed25519 certificate update (%i)
+After=certd.service
+BindsTo=certd.service
+
+[Path]
+PathChanged=%t/certd/cert-updated-ed25519
+
+[Install]
+WantedBy=multi-user.target
