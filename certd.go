@@ -346,9 +346,9 @@ func checkOne(
 	// Update store with current cert state
 	store.setOK(alg, cert)
 
-	// Case 2: hostname changed
-	if st.hostname != "" && hostname != st.hostname {
-		logger.Info("hostname changed", "old", st.hostname, "new", hostname)
+	// Case 2: hostname changed (or cert does not include current hostname)
+	if cert.Subject.CommonName != hostname || !stringSliceContains(cert.DNSNames, hostname) {
+		logger.Info("hostname changed", "old", cert.Subject.CommonName, "new", hostname)
 		return issueAndNotify("hostname changed")
 	}
 
@@ -673,6 +673,15 @@ func stringSlicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func stringSliceContains(values []string, needle string) bool {
+	for _, v := range values {
+		if v == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func printVersion() {

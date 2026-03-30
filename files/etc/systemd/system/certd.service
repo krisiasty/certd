@@ -51,7 +51,7 @@ ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
-ProtectHostname=yes
+ProtectHostname=no
 
 # Filesystem restrictions — certd only needs its own dirs and /run
 ProtectSystem=strict
