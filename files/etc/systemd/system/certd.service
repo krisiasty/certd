@@ -30,7 +30,7 @@ Environment=CERTD_CERT_DIR=%S/certd
 Environment=CERTD_NOTIFY_DIR=%t/certd
 Environment=CERTD_INTERNAL_IP=true
 Environment=CERTD_EXTERNAL_IP=true
-Environment=CERTD_POLL_INTERVAL=1d
+Environment=CERTD_POLL_INTERVAL=5m
 Environment=CERTD_MAX_RETRIES=5
 Environment=CERTD_HTTP_ADDR=127.0.0.1:8484
 
