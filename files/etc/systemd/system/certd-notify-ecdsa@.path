@@ -1,7 +1,5 @@
 [Unit]
 Description=Watch for certd ecdsa certificate update (%i)
-After=certd.service
-BindsTo=certd.service
 
 [Path]
 PathChanged=%t/certd/cert-updated-ecdsa

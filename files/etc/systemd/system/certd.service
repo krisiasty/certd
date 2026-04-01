@@ -3,6 +3,9 @@ Description=certd - Self-signed certificate generation and management
 Documentation=https://github.com/krisiasty/certd
 After=network-online.target
 Wants=network-online.target
+Wants=certd-notify-ecdsa@configd.path
+Wants=certd-notify-rsa@configd.path
+Wants=certd-notify-ed25519@configd.path
 
 [Service]
 Type=simple
