@@ -32,3 +32,6 @@ go.work.sum
 # .vscode/
 certd
 dist/
+
+# graphify knowledge graph output
+graphify-out/
