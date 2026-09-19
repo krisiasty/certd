@@ -13,6 +13,118 @@ import (
 	"time"
 )
 
+func TestCheckOneReissuesMismatchedCertificateKeyPair(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	const hostname = "host.example.test"
+	if err := issueCert(logger, cfg, algorithmECDSA, paths, hostname, nil, ""); err != nil {
+		t.Fatalf("issue initial certificate: %v", err)
+	}
+	initial := loadTestCertificate(t, paths.cert)
+
+	_, replacementKey, err := generateCert(algorithmECDSA, cfg, hostname, nil, "")
+	if err != nil {
+		t.Fatalf("generate mismatched key: %v", err)
+	}
+	if err := os.WriteFile(paths.key, replacementKey, 0600); err != nil {
+		t.Fatalf("replace private key: %v", err)
+	}
+
+	if err := checkOne(
+		logger,
+		cfg,
+		algorithmECDSA,
+		paths,
+		&certState{},
+		newStatusStore([]algorithm{algorithmECDSA}),
+		hostname,
+		nil,
+		"",
+		true,
+	); err != nil {
+		t.Fatalf("repair certificate/key pair: %v", err)
+	}
+
+	repaired, err := loadCertificateKeyPair(paths, algorithmECDSA)
+	if err != nil {
+		t.Fatalf("load repaired certificate/key pair: %v", err)
+	}
+	if initial.SerialNumber.Cmp(repaired.SerialNumber) == 0 {
+		t.Fatal("certificate was not reissued for a mismatched private key")
+	}
+}
+
+func TestCheckOneReissuesCertificateWithWrongAlgorithm(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	const hostname = "host.example.test"
+	if err := issueCert(logger, cfg, algorithmEd25519, paths, hostname, nil, ""); err != nil {
+		t.Fatalf("issue certificate with wrong algorithm: %v", err)
+	}
+
+	if err := checkOne(
+		logger,
+		cfg,
+		algorithmECDSA,
+		paths,
+		&certState{},
+		newStatusStore([]algorithm{algorithmECDSA}),
+		hostname,
+		nil,
+		"",
+		true,
+	); err != nil {
+		t.Fatalf("repair certificate algorithm: %v", err)
+	}
+	cert, err := loadCertificateKeyPair(paths, algorithmECDSA)
+	if err != nil {
+		t.Fatalf("load repaired certificate/key pair: %v", err)
+	}
+	if cert.PublicKeyAlgorithm != x509.ECDSA {
+		t.Fatalf("public key algorithm = %s, want ECDSA", cert.PublicKeyAlgorithm)
+	}
+}
+
+func TestIssueCertAtomicallyReplacesFilesAndModes(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	for _, path := range []string{paths.cert, paths.key} {
+		if err := os.WriteFile(path, []byte("old data"), 0600); err != nil {
+			t.Fatalf("create existing file: %v", err)
+		}
+		//nolint:gosec // Test verifies that overly broad existing modes are corrected.
+		if err := os.Chmod(path, 0666); err != nil {
+			t.Fatalf("set existing file mode: %v", err)
+		}
+	}
+
+	if err := issueCert(logger, cfg, algorithmECDSA, paths, "host.example.test", nil, ""); err != nil {
+		t.Fatalf("replace certificate/key pair: %v", err)
+	}
+	if _, err := loadCertificateKeyPair(paths, algorithmECDSA); err != nil {
+		t.Fatalf("load replacement certificate/key pair: %v", err)
+	}
+	for _, path := range []string{paths.cert, paths.key} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat replacement file: %v", err)
+		}
+		if got, want := info.Mode().Perm(), os.FileMode(0640); got != want {
+			t.Errorf("mode for %s = %o, want %o", path, got, want)
+		}
+	}
+	tempFiles, err := filepath.Glob(filepath.Join(cfg.certDir, ".*.tmp-*"))
+	if err != nil {
+		t.Fatalf("find staged files: %v", err)
+	}
+	if len(tempFiles) != 0 {
+		t.Fatalf("staged files were not removed: %v", tempFiles)
+	}
+}
+
 func TestCheckOneRetriesFailedNotification(t *testing.T) {
 	t.Parallel()
 
