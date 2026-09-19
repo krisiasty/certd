@@ -108,7 +108,7 @@ sudo usermod -aG certd myservice
 
 Every certificate always includes the following Subject Alternative Names:
 
-- The system hostname (`hostname -f`)
+- The system hostname (`hostname`)
 - `localhost`
 - `127.0.0.1`
 

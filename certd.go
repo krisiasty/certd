@@ -198,6 +198,10 @@ func main() {
 }
 
 func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
+	if err := validateConfig(cfg); err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+
 	algNames := make([]string, len(cfg.algorithms))
 	for i, a := range cfg.algorithms {
 		algNames[i] = string(a)
@@ -217,13 +221,23 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 	store := newStatusStore(cfg.algorithms)
 	startTime := time.Now()
 
-	// Start HTTP server if configured
+	var httpServerErrors <-chan error
+
+	// Bind the HTTP listener synchronously so configuration and address conflicts
+	// fail startup instead of leaving the daemon running without its endpoints.
 	if cfg.httpAddr != "" {
 		srv := newHTTPServer(cfg, store, startTime, logger)
+		var listenConfig net.ListenConfig
+		listener, err := listenConfig.Listen(ctx, "tcp", cfg.httpAddr)
+		if err != nil {
+			return fmt.Errorf("binding HTTP server to %q: %w", cfg.httpAddr, err)
+		}
+		serverErrors := make(chan error, 1)
+		httpServerErrors = serverErrors
 		go func() {
 			logger.Info("starting HTTP server", "addr", cfg.httpAddr)
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("HTTP server error", "err", err)
+			if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serverErrors <- fmt.Errorf("serving HTTP: %w", err)
 			}
 		}()
 		defer func() {
@@ -250,6 +264,11 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 	if !initialCheckOK {
 		return errors.New("initial certificate check failed")
 	}
+	select {
+	case err := <-httpServerErrors:
+		return err
+	default:
+	}
 	if err := notifySystemdReady(); err != nil {
 		return fmt.Errorf("notifying systemd of readiness: %w", err)
 	}
@@ -263,12 +282,30 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 		case <-ctx.Done():
 			logger.Info("shutting down")
 			return ctx.Err()
+		case err := <-httpServerErrors:
+			return err
 		case <-ticker.C:
 			if _, err := checkAll(ctx, cfg, logger, states, store); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+func validateConfig(cfg *config) error {
+	if len(cfg.algorithms) == 0 {
+		return errors.New("at least one certificate algorithm must be enabled")
+	}
+	if cfg.lifetime <= 0 {
+		return fmt.Errorf("certificate lifetime must be positive, got %s", cfg.lifetime)
+	}
+	if cfg.pollInterval <= 0 {
+		return fmt.Errorf("poll interval must be positive, got %s", cfg.pollInterval)
+	}
+	if cfg.externalIP && cfg.maxRetries <= 0 {
+		return fmt.Errorf("maximum retries must be positive when external IP detection is enabled, got %d", cfg.maxRetries)
+	}
+	return nil
 }
 
 // checkAll runs a poll cycle for every enabled algorithm independently.

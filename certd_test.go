@@ -12,9 +12,89 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestRunRejectsInvalidConfigBeforeSideEffects(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*config)
+		wantError string
+	}{
+		{
+			name: "zero poll interval",
+			configure: func(cfg *config) {
+				cfg.pollInterval = 0
+			},
+			wantError: "poll interval must be positive",
+		},
+		{
+			name: "negative poll interval",
+			configure: func(cfg *config) {
+				cfg.pollInterval = -time.Second
+			},
+			wantError: "poll interval must be positive",
+		},
+		{
+			name: "zero certificate lifetime",
+			configure: func(cfg *config) {
+				cfg.lifetime = 0
+			},
+			wantError: "certificate lifetime must be positive",
+		},
+		{
+			name: "zero external IP retries",
+			configure: func(cfg *config) {
+				cfg.externalIP = true
+				cfg.maxRetries = 0
+			},
+			wantError: "maximum retries must be positive",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, paths, logger := newTestCertificateConfig(t, false, false)
+			cfg.algorithms = []algorithm{algorithmECDSA}
+			cfg.pollInterval = time.Hour
+			cfg.maxRetries = 1
+			cfg.httpAddr = ""
+			tt.configure(cfg)
+
+			err := run(context.Background(), cfg, logger)
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("run error = %v, want error containing %q", err, tt.wantError)
+			}
+			if fileExists(paths.cert) || fileExists(paths.key) {
+				t.Fatal("invalid configuration produced certificate files")
+			}
+		})
+	}
+}
+
+func TestRunReturnsHTTPBindErrorBeforeCertificateIssuance(t *testing.T) {
+	var listenConfig net.ListenConfig
+	listener, err := listenConfig.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve HTTP address: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	cfg.algorithms = []algorithm{algorithmECDSA}
+	cfg.pollInterval = time.Hour
+	cfg.httpAddr = listener.Addr().String()
+
+	err = run(context.Background(), cfg, logger)
+	if err == nil || !strings.Contains(err.Error(), "binding HTTP server") {
+		t.Fatalf("run error = %v, want HTTP bind error", err)
+	}
+	if fileExists(paths.cert) || fileExists(paths.key) {
+		t.Fatal("HTTP bind failure produced certificate files")
+	}
+}
 
 func TestRunNotifiesSystemdAfterInitialCertificateCycle(t *testing.T) {
 	socketDir, err := os.MkdirTemp("/tmp", "certd-notify-")
