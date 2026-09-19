@@ -4,14 +4,71 @@
 package main
 
 import (
+	"context"
 	"crypto/x509"
+	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestRunNotifiesSystemdAfterInitialCertificateCycle(t *testing.T) {
+	socketDir, err := os.MkdirTemp("/tmp", "certd-notify-")
+	if err != nil {
+		t.Fatalf("create notification socket directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socketPath := filepath.Join(socketDir, "notify.sock")
+	listener, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: socketPath, Net: "unixgram"})
+	if err != nil {
+		t.Fatalf("listen on notification socket: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+	t.Setenv("NOTIFY_SOCKET", socketPath)
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	cfg.algorithms = []algorithm{algorithmECDSA}
+	cfg.pollInterval = time.Hour
+	cfg.httpAddr = ""
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- run(ctx, cfg, logger)
+	}()
+
+	if err := listener.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set notification read deadline: %v", err)
+	}
+	message := make([]byte, 256)
+	n, _, err := listener.ReadFromUnix(message)
+	if err != nil {
+		cancel()
+		t.Fatalf("read readiness notification: %v", err)
+	}
+	if got, want := string(message[:n]), "READY=1\nSTATUS=Initial certificate check completed"; got != want {
+		cancel()
+		t.Fatalf("readiness notification = %q, want %q", got, want)
+	}
+	if _, err := loadCertificateKeyPair(paths, algorithmECDSA); err != nil {
+		cancel()
+		t.Fatalf("certificate was not ready before notification: %v", err)
+	}
+
+	cancel()
+	select {
+	case err := <-runResult:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run returned %v, want context cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not stop after context cancellation")
+	}
+}
 
 func TestCheckOneReissuesMismatchedCertificateKeyPair(t *testing.T) {
 	t.Parallel()
