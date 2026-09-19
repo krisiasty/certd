@@ -191,7 +191,8 @@ After=certd.service
 Requires=certd.service
 ```
 
-This ensures that on first boot `certd` runs and issues the certificate before the dependent service attempts to start.
+The `certd` unit reports systemd readiness only after its initial certificate cycle completes successfully.
+This ensures that on first boot `certd` issues the certificate before the dependent service attempts to start.
 
 ## HTTP endpoints
 

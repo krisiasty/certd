@@ -241,10 +241,19 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 		states[alg] = &certState{}
 	}
 
-	// Run an immediate check before entering the poll loop
-	if err := checkAll(ctx, cfg, logger, states, store); err != nil {
+	// Run an immediate check before entering the poll loop. Do not report
+	// readiness until every enabled certificate has completed its first cycle.
+	initialCheckOK, err := checkAll(ctx, cfg, logger, states, store)
+	if err != nil {
 		return err
 	}
+	if !initialCheckOK {
+		return errors.New("initial certificate check failed")
+	}
+	if err := notifySystemdReady(); err != nil {
+		return fmt.Errorf("notifying systemd of readiness: %w", err)
+	}
+	logger.Info("certd ready")
 
 	ticker := time.NewTicker(cfg.pollInterval)
 	defer ticker.Stop()
@@ -255,7 +264,7 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 			logger.Info("shutting down")
 			return ctx.Err()
 		case <-ticker.C:
-			if err := checkAll(ctx, cfg, logger, states, store); err != nil {
+			if _, err := checkAll(ctx, cfg, logger, states, store); err != nil {
 				return err
 			}
 		}
@@ -263,11 +272,17 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 }
 
 // checkAll runs a poll cycle for every enabled algorithm independently.
-func checkAll(ctx context.Context, cfg *config, logger *slog.Logger, states map[algorithm]*certState, store *statusStore) error {
+func checkAll(
+	ctx context.Context,
+	cfg *config,
+	logger *slog.Logger,
+	states map[algorithm]*certState,
+	store *statusStore,
+) (bool, error) {
 	// Gather host info once — shared across all algorithms in this cycle
 	hostname, err := os.Hostname()
 	if err != nil {
-		return fmt.Errorf("getting hostname: %w", err)
+		return false, fmt.Errorf("getting hostname: %w", err)
 	}
 
 	var internalIPs []string
@@ -297,7 +312,8 @@ func checkAll(ctx context.Context, cfg *config, logger *slog.Logger, states map[
 		}
 	}
 
-	// Process each algorithm independently — errors are logged but don't stop others
+	// Process each algorithm independently — errors are logged but don't stop others.
+	allSuccessful := true
 	for _, alg := range cfg.algorithms {
 		paths := certPathsForAlgorithm(cfg, alg)
 		st := states[alg]
@@ -315,11 +331,34 @@ func checkAll(ctx context.Context, cfg *config, logger *slog.Logger, states map[
 			externalIP,
 			ipSANsComplete,
 		); err != nil {
+			allSuccessful = false
 			store.recordError(alg, err)
 			algLogger.Error("failed to process certificate, will retry next poll", "err", err)
 		}
 	}
 
+	return allSuccessful, nil
+}
+
+func notifySystemdReady() error {
+	socketPath := os.Getenv("NOTIFY_SOCKET")
+	if socketPath == "" {
+		return nil
+	}
+	if strings.HasPrefix(socketPath, "@") {
+		socketPath = "\x00" + socketPath[1:]
+	}
+
+	address := &net.UnixAddr{Name: socketPath, Net: "unixgram"}
+	conn, err := net.DialUnix("unixgram", nil, address)
+	if err != nil {
+		return fmt.Errorf("connecting to notification socket: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.Write([]byte("READY=1\nSTATUS=Initial certificate check completed")); err != nil {
+		return fmt.Errorf("writing readiness notification: %w", err)
+	}
 	return nil
 }
 

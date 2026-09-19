@@ -8,7 +8,8 @@ Wants=network-online.target
 # See the README for certd-notify-<algorithm>@<service>.path usage.
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=certd
 Group=certd
 
@@ -41,7 +42,7 @@ ExecStart=/usr/local/bin/certd
 
 Restart=on-failure
 RestartSec=10
-TimeoutStartSec=30
+TimeoutStartSec=3min
 
 # --- Hardening ---
 
@@ -68,10 +69,11 @@ ProtectProc=invisible
 # Device access
 PrivateDevices=yes
 
-# Network — certd needs outbound HTTP for external IP detection
+# Network — certd needs AF_UNIX to notify systemd and outbound HTTP for
+# external IP detection
 # Remove PrivateNetwork so it can reach external IP providers and
 # the host network for internal IP detection
-RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 # System call filtering — allow only what certd needs
 SystemCallFilter=@system-service
