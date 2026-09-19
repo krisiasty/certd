@@ -10,6 +10,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"embed"
@@ -364,11 +365,12 @@ func checkOne(
 		return issueAndNotify("missing")
 	}
 
-	// Parse existing cert
-	cert, err := loadCert(paths.cert)
+	// Parse the existing certificate and verify that its private key matches the
+	// certificate and the algorithm selected for this path.
+	cert, err := loadCertificateKeyPair(paths, alg)
 	if err != nil {
-		logger.Warn("failed to parse existing certificate, re-issuing", "err", err)
-		return issueAndNotify("unparsable")
+		logger.Warn("existing certificate/key pair is invalid, re-issuing", "err", err)
+		return issueAndNotify("invalid certificate/key pair")
 	}
 
 	// Update store with current cert state
@@ -464,11 +466,11 @@ func issueCert(
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	if err := os.WriteFile(paths.cert, certPEM, 0640); err != nil { //#nosec G306
-		return fmt.Errorf("writing cert file: %w", err)
+	if err := replaceCertificateFiles(paths, certPEM, keyPEM); err != nil {
+		return err
 	}
-	if err := os.WriteFile(paths.key, keyPEM, 0640); err != nil { //#nosec G306
-		return fmt.Errorf("writing key file: %w", err)
+	if _, err := loadCertificateKeyPair(paths, alg); err != nil {
+		return fmt.Errorf("validating written certificate/key pair: %w", err)
 	}
 
 	logger.Info("certificate issued successfully", "cert", paths.cert, "key", paths.key)
@@ -669,6 +671,118 @@ func loadCert(path string) (*x509.Certificate, error) {
 		return nil, fmt.Errorf("no PEM block in %s", path)
 	}
 	return x509.ParseCertificate(block.Bytes)
+}
+
+func loadCertificateKeyPair(paths certPaths, alg algorithm) (*x509.Certificate, error) {
+	certPEM, err := os.ReadFile(paths.cert)
+	if err != nil {
+		return nil, fmt.Errorf("reading certificate: %w", err)
+	}
+	keyPEM, err := os.ReadFile(paths.key)
+	if err != nil {
+		return nil, fmt.Errorf("reading private key: %w", err)
+	}
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("loading certificate/key pair: %w", err)
+	}
+	if len(pair.Certificate) == 0 {
+		return nil, errors.New("certificate/key pair contains no certificates")
+	}
+	cert, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("parsing certificate: %w", err)
+	}
+	if !certificateUsesAlgorithm(cert, alg) {
+		return nil, fmt.Errorf(
+			"certificate uses %s public key, expected %s",
+			cert.PublicKeyAlgorithm,
+			alg,
+		)
+	}
+	return cert, nil
+}
+
+func certificateUsesAlgorithm(cert *x509.Certificate, alg algorithm) bool {
+	switch alg {
+	case algorithmRSA:
+		return cert.PublicKeyAlgorithm == x509.RSA
+	case algorithmECDSA:
+		return cert.PublicKeyAlgorithm == x509.ECDSA
+	case algorithmEd25519:
+		return cert.PublicKeyAlgorithm == x509.Ed25519
+	default:
+		return false
+	}
+}
+
+func replaceCertificateFiles(paths certPaths, certPEM, keyPEM []byte) error {
+	certDir := filepath.Dir(paths.cert)
+	if keyDir := filepath.Dir(paths.key); keyDir != certDir {
+		return fmt.Errorf("certificate and key must use the same directory: %s != %s", certDir, keyDir)
+	}
+
+	keyTemp, err := stageFileForReplacement(paths.key, keyPEM, 0640)
+	if err != nil {
+		return fmt.Errorf("staging private key: %w", err)
+	}
+	defer func() { _ = os.Remove(keyTemp) }()
+
+	certTemp, err := stageFileForReplacement(paths.cert, certPEM, 0640)
+	if err != nil {
+		return fmt.Errorf("staging certificate: %w", err)
+	}
+	defer func() { _ = os.Remove(certTemp) }()
+
+	// Publish the certificate last. Consumers that react to certificate changes
+	// will therefore only observe the new certificate after its key is in place.
+	if err := os.Rename(keyTemp, paths.key); err != nil {
+		return fmt.Errorf("replacing private key: %w", err)
+	}
+	if err := os.Rename(certTemp, paths.cert); err != nil {
+		return fmt.Errorf("replacing certificate: %w", err)
+	}
+
+	dir, err := os.Open(certDir)
+	if err != nil {
+		return fmt.Errorf("opening certificate directory for sync: %w", err)
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return fmt.Errorf("syncing certificate directory: %w", err)
+	}
+	if err := dir.Close(); err != nil {
+		return fmt.Errorf("closing certificate directory: %w", err)
+	}
+	return nil
+}
+
+func stageFileForReplacement(target string, data []byte, mode fs.FileMode) (string, error) {
+	temp, err := os.CreateTemp(filepath.Dir(target), "."+filepath.Base(target)+".tmp-*")
+	if err != nil {
+		return "", err
+	}
+	tempPath := temp.Name()
+	fail := func(err error) (string, error) {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+		return "", err
+	}
+
+	if err := temp.Chmod(mode); err != nil {
+		return fail(err)
+	}
+	if _, err := temp.Write(data); err != nil {
+		return fail(err)
+	}
+	if err := temp.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return "", err
+	}
+	return tempPath, nil
 }
 
 // touchNotifyFile creates or updates the mtime of the per-algorithm notification file.
