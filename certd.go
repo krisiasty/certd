@@ -269,10 +269,12 @@ func checkAll(ctx context.Context, cfg *config, logger *slog.Logger, states map[
 	}
 
 	var internalIPs []string
+	ipSANsComplete := true
 	if cfg.internalIP {
 		internalIPs, err = getInternalIPs()
 		if err != nil {
 			logger.Warn("failed to get internal IPs, continuing without them", "err", err)
+			ipSANsComplete = false
 		}
 	}
 
@@ -287,6 +289,9 @@ func checkAll(ctx context.Context, cfg *config, logger *slog.Logger, states map[
 				"err", err,
 			)
 			externalIP = lastKnown
+			if externalIP == "" {
+				ipSANsComplete = false
+			}
 		}
 	}
 
@@ -296,7 +301,18 @@ func checkAll(ctx context.Context, cfg *config, logger *slog.Logger, states map[
 		st := states[alg]
 		algLogger := logger.With("algorithm", alg)
 
-		if err := checkOne(algLogger, cfg, alg, paths, st, store, hostname, internalIPs, externalIP); err != nil {
+		if err := checkOne(
+			algLogger,
+			cfg,
+			alg,
+			paths,
+			st,
+			store,
+			hostname,
+			internalIPs,
+			externalIP,
+			ipSANsComplete,
+		); err != nil {
 			store.recordError(alg, err)
 			algLogger.Error("failed to process certificate, will retry next poll", "err", err)
 		}
@@ -316,6 +332,7 @@ func checkOne(
 	hostname string,
 	internalIPs []string,
 	externalIP string,
+	ipSANsComplete bool,
 ) error {
 	issueAndNotify := func(reason string) error {
 		logger.Info("issuing certificate", "reason", reason)
@@ -352,19 +369,24 @@ func checkOne(
 		return issueAndNotify("hostname changed")
 	}
 
-	// Case 3: internal IPs changed
-	if cfg.internalIP && st.hostname != "" && !stringSlicesEqual(internalIPs, st.internalIPs) {
-		logger.Info("internal IPs changed", "old", st.internalIPs, "new", internalIPs)
-		return issueAndNotify("internal IPs changed")
+	// Case 3: IP SANs differ from the addresses currently assigned to the host.
+	// Compare with the certificate itself so changes that happened while certd was
+	// stopped are detected on the first poll after startup. If address discovery
+	// was incomplete, retain the existing certificate until a later poll can make
+	// a complete comparison.
+	if ipSANsComplete {
+		desiredIPs := certificateIPAddresses(internalIPs, externalIP)
+		if !ipAddressSetsEqual(cert.IPAddresses, desiredIPs) {
+			logger.Info(
+				"certificate IP SANs changed",
+				"old", ipAddressesToStrings(cert.IPAddresses),
+				"new", ipAddressesToStrings(desiredIPs),
+			)
+			return issueAndNotify("IP SANs changed")
+		}
 	}
 
-	// Case 4: external IP changed
-	if cfg.externalIP && st.externalIP != "" && externalIP != "" && externalIP != st.externalIP {
-		logger.Info("external IP changed", "old", st.externalIP, "new", externalIP)
-		return issueAndNotify("external IP changed")
-	}
-
-	// Case 5: renewal due
+	// Case 4: renewal due
 	if needsRenewal(cert, renewThreshold) {
 		logger.Info("certificate approaching expiry",
 			"notAfter", cert.NotAfter,
@@ -432,17 +454,7 @@ func issueCert(
 
 // generateCert builds the x509 template and dispatches to the right key generator.
 func generateCert(alg algorithm, cfg *config, hostname string, internalIPs []string, externalIP string) (certDER []byte, keyPEM []byte, err error) {
-	ipAddresses := []net.IP{net.ParseIP("127.0.0.1")}
-	for _, ip := range internalIPs {
-		if parsed := net.ParseIP(ip); parsed != nil {
-			ipAddresses = append(ipAddresses, parsed)
-		}
-	}
-	if externalIP != "" {
-		if parsed := net.ParseIP(externalIP); parsed != nil {
-			ipAddresses = append(ipAddresses, parsed)
-		}
-	}
+	ipAddresses := certificateIPAddresses(internalIPs, externalIP)
 
 	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
@@ -663,16 +675,57 @@ func updateState(st *certState, hostname string, internalIPs []string, externalI
 	st.externalIP = externalIP
 }
 
-func stringSlicesEqual(a, b []string) bool {
-	if len(a) != len(b) {
+func certificateIPAddresses(internalIPs []string, externalIP string) []net.IP {
+	candidates := make([]string, 0, 1+len(internalIPs)+1)
+	candidates = append(candidates, "127.0.0.1")
+	candidates = append(candidates, internalIPs...)
+	if externalIP != "" {
+		candidates = append(candidates, externalIP)
+	}
+
+	seen := make(map[string]struct{}, len(candidates))
+	ips := make([]net.IP, 0, len(candidates))
+	for _, candidate := range candidates {
+		ip := net.ParseIP(candidate)
+		if ip == nil {
+			continue
+		}
+		canonical := ip.String()
+		if _, exists := seen[canonical]; exists {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		ips = append(ips, ip)
+	}
+	return ips
+}
+
+func ipAddressSetsEqual(a, b []net.IP) bool {
+	aSet := make(map[string]struct{}, len(a))
+	for _, ip := range a {
+		aSet[ip.String()] = struct{}{}
+	}
+	bSet := make(map[string]struct{}, len(b))
+	for _, ip := range b {
+		bSet[ip.String()] = struct{}{}
+	}
+	if len(aSet) != len(bSet) {
 		return false
 	}
-	for i := range a {
-		if a[i] != b[i] {
+	for ip := range aSet {
+		if _, exists := bSet[ip]; !exists {
 			return false
 		}
 	}
 	return true
+}
+
+func ipAddressesToStrings(ips []net.IP) []string {
+	values := make([]string, len(ips))
+	for i, ip := range ips {
+		values[i] = ip.String()
+	}
+	return values
 }
 
 func stringSliceContains(values []string, needle string) bool {
