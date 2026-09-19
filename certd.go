@@ -131,9 +131,10 @@ type certPaths struct {
 
 // certState holds the last known state for a single algorithm's certificate.
 type certState struct {
-	hostname    string
-	internalIPs []string
-	externalIP  string
+	hostname            string
+	internalIPs         []string
+	externalIP          string
+	notificationPending bool
 }
 
 // config holds all runtime configuration for the daemon.
@@ -334,6 +335,15 @@ func checkOne(
 	externalIP string,
 	ipSANsComplete bool,
 ) error {
+	notify := func() error {
+		if err := touchNotifyFile(logger, paths.notify); err != nil {
+			st.notificationPending = true
+			return err
+		}
+		st.notificationPending = false
+		return nil
+	}
+
 	issueAndNotify := func(reason string) error {
 		logger.Info("issuing certificate", "reason", reason)
 		if err := issueCert(logger, cfg, alg, paths, hostname, internalIPs, externalIP); err != nil {
@@ -345,7 +355,8 @@ func checkOne(
 		if cert, err := loadCert(paths.cert); err == nil {
 			store.setOK(alg, cert)
 		}
-		return touchNotifyFile(logger, paths.notify)
+		st.notificationPending = true
+		return notify()
 	}
 
 	// Case 1: cert or key missing
@@ -393,6 +404,18 @@ func checkOne(
 			"remaining", time.Until(cert.NotAfter).Round(time.Hour),
 		)
 		return issueAndNotify("renewal due")
+	}
+
+	staleNotification := false
+	if !st.notificationPending {
+		staleNotification, err = notificationOlderThanCertificate(paths)
+		if err != nil {
+			return fmt.Errorf("checking notification state: %w", err)
+		}
+	}
+	if st.notificationPending || staleNotification {
+		logger.Info("retrying certificate update notification", "path", paths.notify)
+		return notify()
 	}
 
 	// No action needed — update state on first successful poll
@@ -662,6 +685,33 @@ func touchNotifyFile(logger *slog.Logger, path string) error {
 	}
 	logger.Info("touched notify file", "path", path)
 	return nil
+}
+
+func notificationOlderThanCertificate(paths certPaths) (bool, error) {
+	certInfo, err := os.Stat(paths.cert)
+	if err != nil {
+		return false, fmt.Errorf("stating certificate: %w", err)
+	}
+	keyInfo, err := os.Stat(paths.key)
+	if err != nil {
+		return false, fmt.Errorf("stating private key: %w", err)
+	}
+	notifyInfo, err := os.Stat(paths.notify)
+	if errors.Is(err, fs.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("stating notification file: %w", err)
+	}
+	if !notifyInfo.Mode().IsRegular() {
+		return true, nil
+	}
+
+	latestCertificateUpdate := certInfo.ModTime()
+	if keyInfo.ModTime().After(latestCertificateUpdate) {
+		latestCertificateUpdate = keyInfo.ModTime()
+	}
+	return notifyInfo.ModTime().Before(latestCertificateUpdate), nil
 }
 
 func fileExists(path string) bool {

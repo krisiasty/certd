@@ -7,9 +7,105 @@ import (
 	"crypto/x509"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestCheckOneRetriesFailedNotification(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	blockedNotifyDir := filepath.Join(t.TempDir(), "notify")
+	if err := os.WriteFile(blockedNotifyDir, []byte("not a directory"), 0600); err != nil {
+		t.Fatalf("create notification blocker: %v", err)
+	}
+	paths.notify = filepath.Join(blockedNotifyDir, "cert-updated-ecdsa")
+	state := &certState{}
+	store := newStatusStore([]algorithm{algorithmECDSA})
+	const hostname = "host.example.test"
+
+	if err := checkOne(
+		logger,
+		cfg,
+		algorithmECDSA,
+		paths,
+		state,
+		store,
+		hostname,
+		nil,
+		"",
+		true,
+	); err == nil {
+		t.Fatal("initial check succeeded despite blocked notification path")
+	}
+	if !state.notificationPending {
+		t.Fatal("failed notification was not recorded as pending")
+	}
+	issued := loadTestCertificate(t, paths.cert)
+
+	if err := os.Remove(blockedNotifyDir); err != nil {
+		t.Fatalf("remove notification blocker: %v", err)
+	}
+	if err := checkOne(
+		logger,
+		cfg,
+		algorithmECDSA,
+		paths,
+		state,
+		store,
+		hostname,
+		nil,
+		"",
+		true,
+	); err != nil {
+		t.Fatalf("retry notification: %v", err)
+	}
+	if state.notificationPending {
+		t.Fatal("notification remained pending after successful retry")
+	}
+	if _, err := os.Stat(paths.notify); err != nil {
+		t.Fatalf("notification file was not created: %v", err)
+	}
+	afterRetry := loadTestCertificate(t, paths.cert)
+	if issued.SerialNumber.Cmp(afterRetry.SerialNumber) != 0 {
+		t.Fatal("certificate was unnecessarily reissued while retrying notification")
+	}
+}
+
+func TestCheckOneRecoversMissedNotificationAfterRestart(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	const hostname = "host.example.test"
+	if err := issueCert(logger, cfg, algorithmECDSA, paths, hostname, nil, ""); err != nil {
+		t.Fatalf("issue initial certificate: %v", err)
+	}
+	issued := loadTestCertificate(t, paths.cert)
+
+	if err := checkOne(
+		logger,
+		cfg,
+		algorithmECDSA,
+		paths,
+		&certState{},
+		newStatusStore([]algorithm{algorithmECDSA}),
+		hostname,
+		nil,
+		"",
+		true,
+	); err != nil {
+		t.Fatalf("recover notification after restart: %v", err)
+	}
+	if _, err := os.Stat(paths.notify); err != nil {
+		t.Fatalf("notification file was not created: %v", err)
+	}
+	afterRecovery := loadTestCertificate(t, paths.cert)
+	if issued.SerialNumber.Cmp(afterRecovery.SerialNumber) != 0 {
+		t.Fatal("certificate was unnecessarily reissued while recovering notification")
+	}
+}
 
 func TestCheckOneReissuesForIPSANChangesAfterRestart(t *testing.T) {
 	t.Parallel()
