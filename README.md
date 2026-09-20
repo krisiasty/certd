@@ -236,6 +236,11 @@ Because touching that file restarts every service that depends on the certificat
 notifying as soon as it is asked to shut down, and leaves any remaining work to the next start. A `SIGTERM`
 arriving mid-cycle therefore never restarts dependent services on the way out, and `certd` still exits zero.
 
+Certificates and keys are replaced by writing a staging file alongside the target and renaming it into place, so
+a reader never sees a partly written file. A process killed outright between the two steps leaves the staging
+file behind, holding a private key; `certd` removes any it finds in `CERTD_CERT_DIR` at startup, for every
+algorithm, including ones that are no longer enabled.
+
 ### Notification files
 
 After issuing or renewing a certificate, `certd` touches a file in `CERTD_NOTIFY_DIR`:

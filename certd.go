@@ -333,6 +333,10 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 		states[alg] = &certState{}
 	}
 
+	// Sweep before the first check, while nothing staged in the certificate
+	// directory can belong to this process.
+	removeStagedFiles(cfg, logger)
+
 	// Run an immediate check before entering the poll loop. Do not report
 	// readiness until every enabled certificate has completed its first cycle.
 	initialCheckOK, err := checkAll(ctx, cfg, logger, states, store)
@@ -1229,8 +1233,63 @@ func replaceCertificateFiles(paths certPaths, certPEM, keyPEM []byte) error {
 	return nil
 }
 
+// allAlgorithms lists every algorithm certd can manage, including ones this
+// configuration has switched off. Staged files are swept for all of them,
+// because disabling an algorithm must not strand key material an earlier run
+// left behind under its name.
+var allAlgorithms = []algorithm{algorithmRSA, algorithmECDSA, algorithmEd25519}
+
+// removeStagedFiles deletes staging files left in the certificate directory by
+// an earlier run. Replacing a certificate means writing a temporary file and
+// renaming it over the target, so a process killed between the two leaves one
+// behind, holding a private key that will never be used and that nothing else
+// would ever remove.
+//
+// Only names this daemon could have created are considered, and only at
+// startup, when none of them can belong to the running process.
+func removeStagedFiles(cfg *config, logger *slog.Logger) {
+	prefixes := make([]string, 0, 2*len(allAlgorithms))
+	for _, alg := range allAlgorithms {
+		paths := certPathsForAlgorithm(cfg, alg)
+		prefixes = append(prefixes,
+			stagedFilePrefix(paths.cert),
+			stagedFilePrefix(paths.key),
+		)
+	}
+
+	entries, err := os.ReadDir(cfg.certDir)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			logger.Warn("could not check for staged files", "dir", cfg.certDir, "err", err)
+		}
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !slices.ContainsFunc(prefixes, func(p string) bool { return strings.HasPrefix(name, p) }) {
+			continue
+		}
+		path := filepath.Join(cfg.certDir, name)
+		if err := os.Remove(path); err != nil {
+			logger.Warn("could not remove staged file left by an earlier run", "path", path, "err", err)
+			continue
+		}
+		logger.Warn("removed staged file left by an earlier run", "path", path)
+	}
+}
+
+// stagedFilePrefix returns the fixed part of the name stageFileForReplacement
+// gives a staging file for target, before the random suffix CreateTemp adds.
+func stagedFilePrefix(target string) string {
+	return "." + filepath.Base(target) + ".tmp-"
+}
+
 func stageFileForReplacement(target string, data []byte, mode fs.FileMode) (string, error) {
-	temp, err := os.CreateTemp(filepath.Dir(target), "."+filepath.Base(target)+".tmp-*")
+	temp, err := os.CreateTemp(filepath.Dir(target), stagedFilePrefix(target)+"*")
 	if err != nil {
 		return "", err
 	}
@@ -1241,13 +1300,16 @@ func stageFileForReplacement(target string, data []byte, mode fs.FileMode) (stri
 		return "", err
 	}
 
-	if err := temp.Chmod(mode); err != nil {
-		return fail(err)
-	}
 	if _, err := temp.Write(data); err != nil {
 		return fail(err)
 	}
 	if err := temp.Sync(); err != nil {
+		return fail(err)
+	}
+	// Widened only now that the contents are on disk. CreateTemp makes the file
+	// owner-only, so a staging file orphaned by a kill during the write above is
+	// not group-readable while it waits to be swept.
+	if err := temp.Chmod(mode); err != nil {
 		return fail(err)
 	}
 	if err := temp.Close(); err != nil {

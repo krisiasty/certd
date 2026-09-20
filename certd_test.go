@@ -491,6 +491,11 @@ func TestRunExitsCleanlyWhenShutDownBeforeTheFirstCheck(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
+	orphaned := filepath.Join(cfg.certDir, ".server_ecdsa.key.tmp-42")
+	if err := os.WriteFile(orphaned, []byte("-----BEGIN PRIVATE KEY-----\n"), 0o600); err != nil {
+		t.Fatalf("writing staged file: %v", err)
+	}
+
 	// main treats context.Canceled as a clean exit, so this is the difference
 	// between exit 0 and a unit reported as failed.
 	if err := run(ctx, cfg, logger); !errors.Is(err, context.Canceled) {
@@ -502,6 +507,64 @@ func TestRunExitsCleanlyWhenShutDownBeforeTheFirstCheck(t *testing.T) {
 	if fileExists(paths.notify) {
 		t.Fatal("dependent services were notified while shutting down")
 	}
+	// Sweeping key material an earlier run left behind is cleanup, and happens
+	// even on a start that is immediately asked to stop.
+	if fileExists(orphaned) {
+		t.Fatal("staged key material from an earlier run was left in place")
+	}
+}
+
+func TestRemoveStagedFilesClearsOrphanedKeyMaterial(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	cfg.algorithms = []algorithm{algorithmECDSA}
+
+	write := func(name string) string {
+		t.Helper()
+		full := filepath.Join(cfg.certDir, name)
+		if err := os.WriteFile(full, []byte("-----BEGIN PRIVATE KEY-----\n"), 0o600); err != nil {
+			t.Fatalf("writing %s: %v", name, err)
+		}
+		return full
+	}
+
+	// Left behind by a process killed between staging and rename.
+	orphanedKey := write(".server_ecdsa.key.tmp-1234567890")
+	orphanedCert := write(".server_ecdsa.crt.tmp-987654321")
+	// An algorithm that is no longer enabled can still have left one behind.
+	orphanedDisabled := write(".server_rsa.key.tmp-555")
+	// Neither of these is ours, and neither may be touched.
+	unrelated := write(".gitignore")
+	otherTemp := write(".unrelated.tmp-1")
+
+	if err := issueCert(logger, cfg, algorithmECDSA, paths, "host.example.test",
+		certificateIPAddresses(nil, "", nil)); err != nil {
+		t.Fatalf("issue certificate: %v", err)
+	}
+
+	removeStagedFiles(cfg, logger)
+
+	for _, path := range []string{orphanedKey, orphanedCert, orphanedDisabled} {
+		if fileExists(path) {
+			t.Fatalf("%s was left behind", filepath.Base(path))
+		}
+	}
+	for _, path := range []string{unrelated, otherTemp, paths.cert, paths.key} {
+		if !fileExists(path) {
+			t.Fatalf("%s was removed but is not a staging file of ours", filepath.Base(path))
+		}
+	}
+}
+
+func TestRemoveStagedFilesToleratesAMissingDirectory(t *testing.T) {
+	t.Parallel()
+
+	cfg, _, logger := newTestCertificateConfig(t, false, false)
+	cfg.certDir = filepath.Join(cfg.certDir, "not-created-yet")
+	cfg.algorithms = []algorithm{algorithmECDSA}
+
+	removeStagedFiles(cfg, logger) // must not panic or fail
 }
 
 func TestCheckAllStopsIssuingWhenShuttingDown(t *testing.T) {
