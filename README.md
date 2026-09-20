@@ -11,6 +11,7 @@ Dependent services are notified via filesystem notification files watched by sys
 - Multiple algorithms can be active simultaneously, each producing independent certificate files
 - Automatically detects hostname, internal IP addresses, and optionally the external (NAT) IP
 - Re-issues certificates on hostname or IP address changes
+- Re-issues certificates when `CERTD_LIFETIME` changes, so a new lifetime applies at the next poll
 - Renews certificates when less than one third of their lifetime remains
 - Notifies dependent services via per-algorithm notification files
 - Exposes an HTTP health and Prometheus metrics endpoint

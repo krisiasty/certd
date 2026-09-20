@@ -516,6 +516,18 @@ func checkOne(
 		return issueAndNotify("IP SANs changed", issueIPs)
 	}
 
+	// Case: the configured lifetime no longer matches the certificate. The
+	// lifetime is part of the certificate this host should have, exactly like
+	// its hostname and its IP SANs, so a change applies at the next poll.
+	// Leaving it to the renewal check instead would measure the threshold
+	// against the span the old certificate happens to have: shortening the
+	// lifetime from a year to a month would then change nothing until the
+	// year-long certificate approached its own expiry, eight months later.
+	if span := cert.NotAfter.Sub(cert.NotBefore); span != cfg.lifetime {
+		logger.Info("configured certificate lifetime changed", "old", span, "new", cfg.lifetime)
+		return issueAndNotify("lifetime changed", issueIPs)
+	}
+
 	// Case: renewal due
 	if needsRenewal(cert, renewThreshold) {
 		logger.Info("certificate approaching expiry",
@@ -766,7 +778,10 @@ func getExternalIP(ctx context.Context, logger *slog.Logger) (string, error) {
 	return "", errExternalIPCheckFailed
 }
 
-// needsRenewal returns true when less than threshold fraction of lifetime remains.
+// needsRenewal returns true when less than threshold fraction of lifetime
+// remains. The certificate's own span is the right measure here only because
+// the lifetime check above guarantees it equals the configured lifetime by the
+// time this runs.
 func needsRenewal(cert *x509.Certificate, threshold float64) bool {
 	lifetime := cert.NotAfter.Sub(cert.NotBefore)
 	remaining := time.Until(cert.NotAfter)

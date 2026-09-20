@@ -4,10 +4,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"errors"
-	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -478,16 +478,22 @@ func TestCheckOneRetainsIPSANsWhenReissuingWithIncompleteDiscovery(t *testing.T)
 		name           string
 		issuedHostname string
 		issuedLifetime time.Duration
+		checkLifetime  time.Duration
+		wantReason     string
 	}{
 		{
 			name:           "hostname changed",
 			issuedHostname: previousHostname,
 			issuedLifetime: 24 * time.Hour,
+			checkLifetime:  24 * time.Hour,
+			wantReason:     "hostname changed",
 		},
 		{
-			name:           "renewal due",
+			name:           "lifetime changed",
 			issuedHostname: currentHostname,
-			issuedLifetime: time.Nanosecond,
+			issuedLifetime: 24 * time.Hour,
+			checkLifetime:  12 * time.Hour,
+			wantReason:     "lifetime changed",
 		},
 	}
 
@@ -495,7 +501,7 @@ func TestCheckOneRetainsIPSANsWhenReissuingWithIncompleteDiscovery(t *testing.T)
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			cfg, paths, logger := newTestCertificateConfig(t, true, true)
+			cfg, paths, logger, logged := newTestCertificateConfigWithLog(t, true, true)
 			cfg.lifetime = tt.issuedLifetime
 			if err := issueCert(
 				logger,
@@ -507,9 +513,9 @@ func TestCheckOneRetainsIPSANsWhenReissuingWithIncompleteDiscovery(t *testing.T)
 			); err != nil {
 				t.Fatalf("issue initial certificate: %v", err)
 			}
-			cfg.lifetime = 24 * time.Hour
 
 			before := loadTestCertificate(t, paths.cert)
+			cfg.lifetime = tt.checkLifetime
 			if err := checkOne(
 				logger,
 				cfg,
@@ -526,6 +532,9 @@ func TestCheckOneRetainsIPSANsWhenReissuingWithIncompleteDiscovery(t *testing.T)
 			after := loadTestCertificate(t, paths.cert)
 			if before.SerialNumber.Cmp(after.SerialNumber) == 0 {
 				t.Fatal("certificate was not reissued")
+			}
+			if want := `reason="` + tt.wantReason + `"`; !strings.Contains(logged.String(), want) {
+				t.Fatalf("certificate was reissued for another reason than %s:\n%s", tt.wantReason, logged)
 			}
 			if !ipAddressSetsEqual(after.IPAddresses, before.IPAddresses) {
 				t.Fatalf(
@@ -794,6 +803,138 @@ func TestCheckOneIssuesMissingCertificateDespiteIncompleteDiscovery(t *testing.T
 	}
 }
 
+func TestCheckOneReissuesWhenConfiguredLifetimeChanges(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		issued   time.Duration
+		modified time.Duration
+	}{
+		{name: "lifetime shortened", issued: 24 * time.Hour, modified: time.Hour},
+		{name: "lifetime lengthened", issued: time.Hour, modified: 24 * time.Hour},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, paths, logger := newTestCertificateConfig(t, false, false)
+			const hostname = "host.example.test"
+			cfg.lifetime = tt.issued
+			if err := issueCert(
+				logger,
+				cfg,
+				algorithmECDSA,
+				paths,
+				hostname,
+				certificateIPAddresses(nil, ""),
+			); err != nil {
+				t.Fatalf("issue initial certificate: %v", err)
+			}
+			before := loadTestCertificate(t, paths.cert)
+
+			cfg.lifetime = tt.modified
+			if err := checkOne(
+				logger,
+				cfg,
+				algorithmECDSA,
+				paths,
+				&certState{},
+				newStatusStore([]algorithm{algorithmECDSA}),
+				hostname,
+				completeDiscovery(nil, ""),
+			); err != nil {
+				t.Fatalf("check certificate: %v", err)
+			}
+
+			after := loadTestCertificate(t, paths.cert)
+			if before.SerialNumber.Cmp(after.SerialNumber) == 0 {
+				t.Fatal("certificate was not reissued after the configured lifetime changed")
+			}
+			if span := after.NotAfter.Sub(after.NotBefore); span != tt.modified {
+				t.Fatalf("reissued certificate lifetime = %s, want %s", span, tt.modified)
+			}
+		})
+	}
+}
+
+func TestCheckOneReissuesOnceAfterLifetimeChange(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	const hostname = "host.example.test"
+	cfg.lifetime = 24 * time.Hour
+	if err := issueCert(
+		logger,
+		cfg,
+		algorithmECDSA,
+		paths,
+		hostname,
+		certificateIPAddresses(nil, ""),
+	); err != nil {
+		t.Fatalf("issue initial certificate: %v", err)
+	}
+
+	cfg.lifetime = 12 * time.Hour
+	st := &certState{}
+	store := newStatusStore([]algorithm{algorithmECDSA})
+	check := func(cycle string) *x509.Certificate {
+		t.Helper()
+		if err := checkOne(
+			logger, cfg, algorithmECDSA, paths, st, store, hostname, completeDiscovery(nil, ""),
+		); err != nil {
+			t.Fatalf("%s: %v", cycle, err)
+		}
+		return loadTestCertificate(t, paths.cert)
+	}
+
+	// The reissued certificate must record the configured lifetime exactly, or
+	// the comparison stays unsatisfied and every poll reissues it again.
+	first := check("first cycle")
+	second := check("second cycle")
+	if first.SerialNumber.Cmp(second.SerialNumber) != 0 {
+		t.Fatalf(
+			"certificate reissued again on an unchanged cycle: lifetime recorded as %s, configured %s",
+			first.NotAfter.Sub(first.NotBefore),
+			cfg.lifetime,
+		)
+	}
+}
+
+func TestNeedsRenewal(t *testing.T) {
+	t.Parallel()
+
+	const span = 24 * time.Hour
+	tests := []struct {
+		name      string
+		remaining time.Duration
+		want      bool
+	}{
+		{name: "freshly issued", remaining: span, want: false},
+		{name: "above threshold", remaining: 9 * time.Hour, want: false},
+		{name: "below threshold", remaining: 7 * time.Hour, want: true},
+		{name: "already expired", remaining: -time.Hour, want: true},
+	}
+
+	// The exact threshold is deliberately untested: remaining is measured
+	// against the wall clock inside needsRenewal, so a case built to sit on the
+	// boundary always lands marginally below it by the time the call is made.
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			notAfter := time.Now().Add(tt.remaining)
+			cert := &x509.Certificate{NotBefore: notAfter.Add(-span), NotAfter: notAfter}
+			if got := needsRenewal(cert, renewThreshold); got != tt.want {
+				t.Fatalf("needsRenewal with %s of %s remaining = %t, want %t",
+					tt.remaining, span, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestREADMEDocumentsActualDefaults(t *testing.T) {
 	t.Parallel()
 
@@ -908,6 +1049,20 @@ func newTestCertificateConfig(
 ) (*config, certPaths, *slog.Logger) {
 	t.Helper()
 
+	cfg, paths, logger, _ := newTestCertificateConfigWithLog(t, internalIP, externalIP)
+	return cfg, paths, logger
+}
+
+// newTestCertificateConfigWithLog additionally returns the captured log output,
+// so a test can assert which branch of checkOne issued a certificate rather than
+// only that one was issued.
+func newTestCertificateConfigWithLog(
+	t *testing.T,
+	internalIP bool,
+	externalIP bool,
+) (*config, certPaths, *slog.Logger, *bytes.Buffer) {
+	t.Helper()
+
 	baseDir := t.TempDir()
 	cfg := &config{
 		lifetime:   24 * time.Hour,
@@ -916,7 +1071,9 @@ func newTestCertificateConfig(
 		internalIP: internalIP,
 		externalIP: externalIP,
 	}
-	return cfg, certPathsForAlgorithm(cfg, algorithmECDSA), slog.New(slog.NewTextHandler(io.Discard, nil))
+	var logged bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logged, nil))
+	return cfg, certPathsForAlgorithm(cfg, algorithmECDSA), logger, &logged
 }
 
 func loadTestCertificate(t *testing.T, path string) *x509.Certificate {
