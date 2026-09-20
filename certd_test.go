@@ -29,21 +29,43 @@ func TestRunRejectsInvalidConfigBeforeSideEffects(t *testing.T) {
 			configure: func(cfg *config) {
 				cfg.pollInterval = 0
 			},
-			wantError: "poll interval must be positive",
+			wantError: "poll interval must be at least",
 		},
 		{
 			name: "negative poll interval",
 			configure: func(cfg *config) {
 				cfg.pollInterval = -time.Second
 			},
-			wantError: "poll interval must be positive",
+			wantError: "poll interval must be at least",
+		},
+		{
+			name: "poll interval below minimum",
+			configure: func(cfg *config) {
+				cfg.pollInterval = time.Second
+			},
+			wantError: "poll interval must be at least",
 		},
 		{
 			name: "zero certificate lifetime",
 			configure: func(cfg *config) {
 				cfg.lifetime = 0
 			},
-			wantError: "certificate lifetime must be positive",
+			wantError: "certificate lifetime must be at least",
+		},
+		{
+			name: "certificate lifetime below minimum",
+			configure: func(cfg *config) {
+				cfg.lifetime = 30 * time.Minute
+			},
+			wantError: "certificate lifetime must be at least",
+		},
+		{
+			name: "poll interval too long to renew in time",
+			configure: func(cfg *config) {
+				cfg.lifetime = 3 * time.Hour
+				cfg.pollInterval = time.Hour
+			},
+			wantError: "no check would fall inside that window",
 		},
 		{
 			name: "zero external IP retries",
@@ -64,12 +86,47 @@ func TestRunRejectsInvalidConfigBeforeSideEffects(t *testing.T) {
 			cfg.httpAddr = ""
 			tt.configure(cfg)
 
-			err := run(context.Background(), cfg, logger)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			err := run(ctx, cfg, logger)
 			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
 				t.Fatalf("run error = %v, want error containing %q", err, tt.wantError)
 			}
 			if fileExists(paths.cert) || fileExists(paths.key) {
 				t.Fatal("invalid configuration produced certificate files")
+			}
+		})
+	}
+}
+
+func TestValidateConfigAcceptsConfigurationsThatCanRenewInTime(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		lifetime     time.Duration
+		pollInterval time.Duration
+	}{
+		{name: "built-in defaults", lifetime: defaultLifetime, pollInterval: defaultPollInterval},
+		{name: "packaged unit", lifetime: defaultLifetime, pollInterval: 5 * time.Minute},
+		{name: "shortest permitted lifetime", lifetime: minLifetime, pollInterval: minPollInterval},
+		{name: "poll just inside the renewal window", lifetime: 3 * time.Hour, pollInterval: time.Hour - time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := &config{
+				algorithms:   []algorithm{algorithmECDSA},
+				lifetime:     tt.lifetime,
+				pollInterval: tt.pollInterval,
+				maxRetries:   defaultMaxRetries,
+			}
+			if err := validateConfig(cfg); err != nil {
+				t.Fatalf("validateConfig(%s lifetime, %s poll) = %v, want nil",
+					tt.lifetime, tt.pollInterval, err)
 			}
 		})
 	}
