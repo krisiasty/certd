@@ -184,6 +184,12 @@ const (
 	// Every algorithm is off by default; parseConfig falls back to ECDSA when
 	// none was selected. Named alongside the rest so the documented defaults
 	// have a single source to be checked against.
+	// Lower bounds for the two interval settings. certd re-issues by touching a
+	// notification file, which restarts every dependent service, so rotating
+	// faster than this costs far more than the shorter lifetime is worth.
+	minLifetime     = 1 * time.Hour
+	minPollInterval = 1 * time.Minute
+
 	defaultRSA        = false
 	defaultECDSA      = false
 	defaultEd25519    = false
@@ -325,11 +331,27 @@ func validateConfig(cfg *config) error {
 	if len(cfg.algorithms) == 0 {
 		return errors.New("at least one certificate algorithm must be enabled")
 	}
-	if cfg.lifetime <= 0 {
-		return fmt.Errorf("certificate lifetime must be positive, got %s", cfg.lifetime)
+	if cfg.lifetime < minLifetime {
+		return fmt.Errorf("certificate lifetime must be at least %s, got %s", minLifetime, cfg.lifetime)
 	}
-	if cfg.pollInterval <= 0 {
-		return fmt.Errorf("poll interval must be positive, got %s", cfg.pollInterval)
+	if cfg.pollInterval < minPollInterval {
+		return fmt.Errorf("poll interval must be at least %s, got %s", minPollInterval, cfg.pollInterval)
+	}
+	// Renewal only begins once less than renewThreshold of the lifetime remains,
+	// and certd notices no sooner than the next poll, so a poll has to fall
+	// inside that window. Otherwise the certificate expires before it is renewed
+	// however generous the threshold looks.
+	renewWindow := time.Duration(float64(cfg.lifetime) * renewThreshold)
+	if cfg.pollInterval >= renewWindow {
+		return fmt.Errorf(
+			"poll interval %s is too long for a %s certificate lifetime: renewal begins with %s remaining, "+
+				"so no check would fall inside that window; use a poll interval under %s, or a lifetime over %s",
+			cfg.pollInterval,
+			cfg.lifetime,
+			renewWindow.Round(time.Second),
+			renewWindow.Round(time.Second),
+			time.Duration(float64(cfg.pollInterval)/renewThreshold).Round(time.Second),
+		)
 	}
 	if cfg.externalIP && cfg.maxRetries <= 0 {
 		return fmt.Errorf("maximum retries must be positive when external IP detection is enabled, got %d", cfg.maxRetries)
