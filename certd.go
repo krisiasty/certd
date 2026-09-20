@@ -190,6 +190,29 @@ const (
 	minLifetime     = 1 * time.Hour
 	minPollInterval = 1 * time.Minute
 
+	// Upper bounds. certd issues self-signed certificates with no revocation
+	// path, so the lifetime is the whole compromise window; 25y is already far
+	// beyond the life of the host it identifies. A poll interval above a day
+	// stops certd doing the job it exists for, since a hostname or address
+	// change goes unnoticed for that long. Each retry costs a flat 16s once the
+	// backoff reaches its cap, so twenty attempts spend about four minutes
+	// before giving up and leaving it to the next poll, which retries anyway
+	// against a last known value kept in the meantime. Retries are separately
+	// held against the poll interval, so this ceiling only binds where the
+	// interval is long enough to afford it.
+	maxLifetime     = 25 * 8760 * time.Hour
+	maxPollInterval = 24 * time.Hour
+	minRetries      = 1
+	maxRetries      = 20
+
+	// maxBackoff caps the delay between external IP attempts. Doubling without
+	// a ceiling makes each extra retry cost as much as every one before it put
+	// together, so the count buys exponential time rather than more attempts:
+	// at twenty retries the final sleep alone runs for six days. Capped, the
+	// same twenty retries cost four and a half minutes. The default of five
+	// never reaches the cap, so its schedule is unchanged.
+	maxBackoff = 16 * time.Second
+
 	defaultRSA        = false
 	defaultECDSA      = false
 	defaultEd25519    = false
@@ -331,11 +354,13 @@ func validateConfig(cfg *config) error {
 	if len(cfg.algorithms) == 0 {
 		return errors.New("at least one certificate algorithm must be enabled")
 	}
-	if cfg.lifetime < minLifetime {
-		return fmt.Errorf("certificate lifetime must be at least %s, got %s", minLifetime, cfg.lifetime)
+	if cfg.lifetime < minLifetime || cfg.lifetime > maxLifetime {
+		return fmt.Errorf("certificate lifetime must be between %s and %s, got %s",
+			humanDuration(minLifetime), humanDuration(maxLifetime), humanDuration(cfg.lifetime))
 	}
-	if cfg.pollInterval < minPollInterval {
-		return fmt.Errorf("poll interval must be at least %s, got %s", minPollInterval, cfg.pollInterval)
+	if cfg.pollInterval < minPollInterval || cfg.pollInterval > maxPollInterval {
+		return fmt.Errorf("poll interval must be between %s and %s, got %s",
+			humanDuration(minPollInterval), humanDuration(maxPollInterval), humanDuration(cfg.pollInterval))
 	}
 	// Renewal only begins once less than renewThreshold of the lifetime remains,
 	// and certd notices no sooner than the next poll, so a poll has to fall
@@ -353,8 +378,26 @@ func validateConfig(cfg *config) error {
 			time.Duration(float64(cfg.pollInterval)/renewThreshold).Round(time.Second),
 		)
 	}
-	if cfg.externalIP && cfg.maxRetries <= 0 {
-		return fmt.Errorf("maximum retries must be positive when external IP detection is enabled, got %d", cfg.maxRetries)
+	// Both retry bounds are conditional because cfg.maxRetries has exactly one
+	// consumer, getExternalIPWithRetry, and that is only reached when external
+	// IP detection is enabled. With it off nothing retries and nothing waits,
+	// so the setting is inert rather than wrong.
+	if cfg.externalIP {
+		if cfg.maxRetries < minRetries || cfg.maxRetries > maxRetries {
+			return fmt.Errorf(
+				"maximum retries must be between %d and %d when external IP detection is enabled, got %d",
+				minRetries, maxRetries, cfg.maxRetries,
+			)
+		}
+		// Retrying for longer than the poll interval is pointless work: the
+		// next poll would have made the same attempt sooner.
+		if budget := retryBackoffBudget(cfg.maxRetries); budget > cfg.pollInterval {
+			return fmt.Errorf(
+				"%d retries wait up to %s between external IP attempts, longer than the %s poll interval; "+
+					"use fewer retries, or a longer poll interval",
+				cfg.maxRetries, humanDuration(budget), humanDuration(cfg.pollInterval),
+			)
+		}
 	}
 	return nil
 }
@@ -737,6 +780,33 @@ func getInternalIPs() ([]string, error) {
 	return ips, nil
 }
 
+// retryBackoffBudget returns the delay getExternalIPWithRetry spends waiting
+// across the given number of attempts, which wait one fewer time than they
+// attempt since nothing is waited after the last one.
+//
+// It counts only the waiting, not the attempts themselves: a provider that
+// refuses a connection fails at once, while one that black-holes it costs a
+// further timeout per provider. That cost is contingent on how the network
+// fails, whereas the backoff is paid every time.
+func retryBackoffBudget(attempts int) time.Duration {
+	var total time.Duration
+	backoff := time.Second
+	for range attempts - 1 {
+		total += backoff
+		backoff = nextBackoff(backoff)
+	}
+	return total
+}
+
+// nextBackoff returns the delay to wait after a failed attempt, doubling up to
+// maxBackoff and holding there.
+func nextBackoff(current time.Duration) time.Duration {
+	if next := current * 2; next < maxBackoff {
+		return next
+	}
+	return maxBackoff
+}
+
 // getExternalIPWithRetry fetches the external IP with exponential backoff.
 func getExternalIPWithRetry(ctx context.Context, maxRetries int, logger *slog.Logger) (string, error) {
 	backoff := time.Second
@@ -747,6 +817,12 @@ func getExternalIPWithRetry(ctx context.Context, maxRetries int, logger *slog.Lo
 			return ip, nil
 		}
 		lastErr = err
+		// The delay belongs between attempts, so there is none after the last
+		// one: waiting there only postpones the error already being returned,
+		// and does so for the longest interval of the whole schedule.
+		if attempt == maxRetries {
+			break
+		}
 		logger.Warn("failed to get external IP, will retry",
 			"attempt", attempt,
 			"maxRetries", maxRetries,
@@ -757,7 +833,7 @@ func getExternalIPWithRetry(ctx context.Context, maxRetries int, logger *slog.Lo
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-time.After(backoff):
-			backoff *= 2
+			backoff = nextBackoff(backoff)
 		}
 	}
 	return "", fmt.Errorf("all %d attempts failed, last error: %w", maxRetries, lastErr)
@@ -1585,35 +1661,91 @@ func envDurationOrDefault(key string, def time.Duration, logger *slog.Logger) ti
 // extendedDurationRe matches a number followed by y, w, or d.
 var extendedDurationRe = regexp.MustCompile(`(\d+)(y|w|d)`)
 
+// humanDuration renders a duration using the extended units parseDuration
+// accepts, so a configuration bound reads as "25y" rather than "219000h0m0s".
+// Whatever it returns parses back to the same value, because operators are
+// expected to copy it into their configuration.
+func humanDuration(d time.Duration) string {
+	switch {
+	case d >= 8760*time.Hour && d%(8760*time.Hour) == 0:
+		return fmt.Sprintf("%dy", d/(8760*time.Hour))
+	case d >= 24*time.Hour && d%(24*time.Hour) == 0:
+		return fmt.Sprintf("%dd", d/(24*time.Hour))
+	case d >= time.Hour && d%time.Hour == 0:
+		return fmt.Sprintf("%dh", d/time.Hour)
+	case d >= time.Minute && d%time.Minute == 0:
+		return fmt.Sprintf("%dm", d/time.Minute)
+	default:
+		return d.String()
+	}
+}
+
+// maxDuration is the largest value a time.Duration can represent, a little over
+// 292 years. Any input implying more than this is rejected rather than wrapped.
+const maxDuration = time.Duration(1<<63 - 1)
+
 // parseDuration extends Go's time.ParseDuration with support for:
 //
 //	y = 365 * 24h
 //	w = 7 * 24h
 //	d = 24h
 //
-// Units can be combined: "1y30d", "2w3d12h", "90d".
+// Units can be combined: "1y30d", "2w3d12h", "90d". Counts are checked against
+// what a time.Duration can hold, so an input larger than roughly 292 years is
+// an error rather than a wrapped, and possibly negative, value.
 func parseDuration(s string) (time.Duration, error) {
+	tooLong := func() error {
+		return fmt.Errorf("invalid duration %q: longer than the maximum of about 292 years", s)
+	}
+
 	var total time.Duration
-	remainder := extendedDurationRe.ReplaceAllStringFunc(s, func(match string) string {
-		m := extendedDurationRe.FindStringSubmatch(match)
-		n, _ := strconv.Atoi(m[1])
-		switch m[2] {
-		case "y":
-			total += time.Duration(n) * 8760 * time.Hour
-		case "w":
-			total += time.Duration(n) * 168 * time.Hour
-		case "d":
-			total += time.Duration(n) * 24 * time.Hour
+	var remainder strings.Builder
+	consumed := 0
+
+	for _, match := range extendedDurationRe.FindAllStringSubmatchIndex(s, -1) {
+		remainder.WriteString(s[consumed:match[0]])
+		consumed = match[1]
+
+		digits := s[match[2]:match[3]]
+		count, err := strconv.ParseInt(digits, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid duration %q: %s is out of range", s, digits)
 		}
-		return ""
-	})
-	if remainder != "" {
-		d, err := time.ParseDuration(remainder)
+
+		var unit time.Duration
+		switch s[match[4]:match[5]] {
+		case "y":
+			unit = 8760 * time.Hour
+		case "w":
+			unit = 168 * time.Hour
+		case "d":
+			unit = 24 * time.Hour
+		}
+
+		if count > int64(maxDuration/unit) {
+			return 0, tooLong()
+		}
+		scaled := time.Duration(count) * unit
+		if total > maxDuration-scaled {
+			return 0, tooLong()
+		}
+		total += scaled
+	}
+	remainder.WriteString(s[consumed:])
+
+	if rest := remainder.String(); rest != "" {
+		d, err := time.ParseDuration(rest)
 		if err != nil {
 			return 0, fmt.Errorf("invalid duration %q: %w", s, err)
 		}
+		// Only a positive remainder can overflow: total is never negative, so
+		// adding a negative one cannot fall below the minimum.
+		if d > 0 && total > maxDuration-d {
+			return 0, tooLong()
+		}
 		total += d
 	}
+
 	if total == 0 && s != "0" {
 		return 0, fmt.Errorf("invalid duration %q", s)
 	}

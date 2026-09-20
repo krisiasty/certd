@@ -29,35 +29,35 @@ func TestRunRejectsInvalidConfigBeforeSideEffects(t *testing.T) {
 			configure: func(cfg *config) {
 				cfg.pollInterval = 0
 			},
-			wantError: "poll interval must be at least",
+			wantError: "poll interval must be between",
 		},
 		{
 			name: "negative poll interval",
 			configure: func(cfg *config) {
 				cfg.pollInterval = -time.Second
 			},
-			wantError: "poll interval must be at least",
+			wantError: "poll interval must be between",
 		},
 		{
 			name: "poll interval below minimum",
 			configure: func(cfg *config) {
 				cfg.pollInterval = time.Second
 			},
-			wantError: "poll interval must be at least",
+			wantError: "poll interval must be between",
 		},
 		{
 			name: "zero certificate lifetime",
 			configure: func(cfg *config) {
 				cfg.lifetime = 0
 			},
-			wantError: "certificate lifetime must be at least",
+			wantError: "certificate lifetime must be between",
 		},
 		{
 			name: "certificate lifetime below minimum",
 			configure: func(cfg *config) {
 				cfg.lifetime = 30 * time.Minute
 			},
-			wantError: "certificate lifetime must be at least",
+			wantError: "certificate lifetime must be between",
 		},
 		{
 			name: "poll interval too long to renew in time",
@@ -73,7 +73,30 @@ func TestRunRejectsInvalidConfigBeforeSideEffects(t *testing.T) {
 				cfg.externalIP = true
 				cfg.maxRetries = 0
 			},
-			wantError: "maximum retries must be positive",
+			wantError: "maximum retries must be between",
+		},
+		{
+			name: "certificate lifetime above maximum",
+			configure: func(cfg *config) {
+				cfg.lifetime = maxLifetime + time.Hour
+			},
+			wantError: "certificate lifetime must be between",
+		},
+		{
+			name: "poll interval above maximum",
+			configure: func(cfg *config) {
+				cfg.lifetime = maxLifetime
+				cfg.pollInterval = maxPollInterval + time.Minute
+			},
+			wantError: "poll interval must be between",
+		},
+		{
+			name: "more retries than permitted",
+			configure: func(cfg *config) {
+				cfg.externalIP = true
+				cfg.maxRetries = maxRetries + 1
+			},
+			wantError: "maximum retries must be between",
 		},
 	}
 
@@ -100,6 +123,58 @@ func TestRunRejectsInvalidConfigBeforeSideEffects(t *testing.T) {
 	}
 }
 
+func TestValidateConfigBoundsRetriesByPollInterval(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		externalIP bool
+		retries    int
+		poll       time.Duration
+		wantError  string
+	}{
+		{name: "default retries at the shortest poll", externalIP: true, retries: defaultMaxRetries, poll: time.Minute},
+		{name: "most retries a one minute poll affords", externalIP: true, retries: 7, poll: time.Minute},
+		{name: "most retries at all, with room for them", externalIP: true, retries: maxRetries, poll: 5 * time.Minute},
+		{
+			name: "retries outlast the poll interval", externalIP: true, retries: maxRetries, poll: time.Minute,
+			wantError: "longer than the",
+		},
+		{
+			name: "more retries than permitted", externalIP: true, retries: maxRetries + 1, poll: time.Hour,
+			wantError: "maximum retries must be between",
+		},
+		// With external IP detection off nothing retries and nothing waits, so
+		// the setting is inert and is not held against the poll interval.
+		{name: "unused retries are not checked", externalIP: false, retries: maxRetries, poll: time.Minute},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := &config{
+				algorithms:   []algorithm{algorithmECDSA},
+				lifetime:     defaultLifetime,
+				pollInterval: tt.poll,
+				externalIP:   tt.externalIP,
+				maxRetries:   tt.retries,
+			}
+			err := validateConfig(cfg)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("validateConfig(%d retries, %s poll) = %v, want nil", tt.retries, tt.poll, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("validateConfig(%d retries, %s poll) = %v, want error containing %q",
+					tt.retries, tt.poll, err, tt.wantError)
+			}
+		})
+	}
+}
+
 func TestValidateConfigAcceptsConfigurationsThatCanRenewInTime(t *testing.T) {
 	t.Parallel()
 
@@ -112,6 +187,8 @@ func TestValidateConfigAcceptsConfigurationsThatCanRenewInTime(t *testing.T) {
 		{name: "packaged unit", lifetime: defaultLifetime, pollInterval: 5 * time.Minute},
 		{name: "shortest permitted lifetime", lifetime: minLifetime, pollInterval: minPollInterval},
 		{name: "poll just inside the renewal window", lifetime: 3 * time.Hour, pollInterval: time.Hour - time.Second},
+		{name: "documented override example", lifetime: 10 * 8760 * time.Hour, pollInterval: 5 * time.Minute},
+		{name: "widest permitted pairing", lifetime: maxLifetime, pollInterval: maxPollInterval},
 	}
 
 	for _, tt := range tests {
@@ -987,6 +1064,195 @@ func TestNeedsRenewal(t *testing.T) {
 			if got := needsRenewal(cert, renewThreshold); got != tt.want {
 				t.Fatalf("needsRenewal with %s of %s remaining = %t, want %t",
 					tt.remaining, span, got, tt.want)
+			}
+		})
+	}
+}
+
+// withFailingExternalIPProviders points external IP detection at a URL that
+// fails when the request is built, so the retry loop runs without touching the
+// network and without waiting for a timeout.
+func withFailingExternalIPProviders(t *testing.T) {
+	t.Helper()
+
+	restore := externalIPProviders
+	t.Cleanup(func() { externalIPProviders = restore })
+	externalIPProviders = []string{"://invalid"}
+}
+
+func TestGetExternalIPWithRetryDoesNotWaitAfterTheFinalAttempt(t *testing.T) {
+	withFailingExternalIPProviders(t)
+
+	start := time.Now()
+	_, err := getExternalIPWithRetry(context.Background(), 1, slog.New(slog.DiscardHandler))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("getExternalIPWithRetry succeeded against a failing provider")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("a single attempt took %s; the delay after the final attempt is never used", elapsed)
+	}
+}
+
+func TestGetExternalIPWithRetryWaitsBetweenAttempts(t *testing.T) {
+	withFailingExternalIPProviders(t)
+
+	// Two attempts wait once, between them: the first delay of one second and
+	// no more. Guards against dropping the wait altogether while removing the
+	// unused one that followed the last attempt.
+	start := time.Now()
+	_, err := getExternalIPWithRetry(context.Background(), 2, slog.New(slog.DiscardHandler))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("getExternalIPWithRetry succeeded against a failing provider")
+	}
+	if elapsed < time.Second {
+		t.Fatalf("two attempts took %s; they did not wait between attempts", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("two attempts took %s; more than one delay was waited", elapsed)
+	}
+}
+
+func TestBackoffStopsDoublingAtTheCap(t *testing.T) {
+	t.Parallel()
+
+	var got []time.Duration
+	backoff := time.Second
+	for range 8 {
+		got = append(got, backoff)
+		backoff = nextBackoff(backoff)
+	}
+
+	want := []time.Duration{
+		time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second,
+		16 * time.Second, 16 * time.Second, 16 * time.Second, 16 * time.Second,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("backoff schedule = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("backoff schedule = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestRetryBackoffStaysBoundedAtMaxRetries(t *testing.T) {
+	t.Parallel()
+
+	// Without a cap the delay doubles with every retry, so the retry count buys
+	// exponential time: at the permitted maximum the last sleep alone would run
+	// for days, and because the first check gates the systemd readiness
+	// notification, it would hold up startup for just as long.
+	total := retryBackoffBudget(maxRetries)
+	if limit := 5 * time.Minute; total > limit {
+		t.Fatalf("worst-case backoff over %d retries = %s, want at most %s", maxRetries, total, limit)
+	}
+}
+
+func TestHumanDuration(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input time.Duration
+		want  string
+	}{
+		{name: "whole years", input: 25 * 8760 * time.Hour, want: "25y"},
+		{name: "one year", input: 8760 * time.Hour, want: "1y"},
+		{name: "whole days", input: 24 * time.Hour, want: "1d"},
+		{name: "whole hours", input: time.Hour, want: "1h"},
+		{name: "whole minutes", input: time.Minute, want: "1m"},
+		{name: "sub-minute precision", input: 90500 * time.Millisecond, want: "1m30.5s"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := humanDuration(tt.input)
+			if got != tt.want {
+				t.Fatalf("humanDuration(%s) = %q, want %q", tt.input, got, tt.want)
+			}
+			// Whatever it prints must read back as the same duration, since the
+			// value is shown to operators as something to put in the config.
+			parsed, err := parseDuration(got)
+			if err != nil {
+				t.Fatalf("humanDuration(%s) = %q, which does not parse: %v", tt.input, got, err)
+			}
+			if parsed != tt.input {
+				t.Fatalf("humanDuration(%s) = %q, which parses back as %s", tt.input, got, parsed)
+			}
+		})
+	}
+}
+
+func TestParseDuration(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		want  time.Duration
+	}{
+		{name: "years", input: "1y", want: 8760 * time.Hour},
+		{name: "weeks", input: "2w", want: 336 * time.Hour},
+		{name: "days", input: "90d", want: 2160 * time.Hour},
+		{name: "combined", input: "1y30d", want: 9480 * time.Hour},
+		{name: "three units", input: "2w3d12h", want: 420 * time.Hour},
+		{name: "standard unit only", input: "90m", want: 90 * time.Minute},
+		{name: "extended and standard", input: "1d12h", want: 36 * time.Hour},
+		{name: "zero", input: "0", want: 0},
+		{name: "largest representable", input: "292y", want: 292 * 8760 * time.Hour},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseDuration(tt.input)
+			if err != nil {
+				t.Fatalf("parseDuration(%q) = %v, want %s", tt.input, err, tt.want)
+			}
+			if got != tt.want {
+				t.Fatalf("parseDuration(%q) = %s, want %s", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseDurationRejectsInvalidInput(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "empty", input: ""},
+		{name: "not a duration", input: "soon"},
+		{name: "unknown unit", input: "5f"},
+		// Each of these silently produced a wrong duration rather than an
+		// error: the count overflowed its multiplication, or the digits did
+		// not fit in an int at all.
+		{name: "count overflows the unit", input: "2000000y"},
+		{name: "count exceeds int64", input: "1h99999999999999999999d"},
+		{name: "beyond the largest duration", input: "293y"},
+		{name: "sum overflows", input: "292y292y"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseDuration(tt.input)
+			if err == nil {
+				t.Fatalf("parseDuration(%q) = %s, want an error", tt.input, got)
+			}
+			if got != 0 {
+				t.Fatalf("parseDuration(%q) returned %s alongside its error, want 0", tt.input, got)
 			}
 		})
 	}
