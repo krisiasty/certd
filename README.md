@@ -19,6 +19,26 @@ Dependent services are notified via filesystem notification files watched by sys
 
 ## Installation
 
+### Requirements
+
+The packaged unit is written for **systemd 247 or newer**. It loads on older releases, but systemd logs
+directives it does not recognise as `Unknown lvalue` and ignores them, so an older release silently applies
+less hardening than the unit appears to describe:
+
+| Directive                               | Added in systemd |
+|-----------------------------------------|------------------|
+| `ProcSubset=`, `ProtectProc=`           | 247              |
+| `ProtectClock=`                         | 245              |
+| `ProtectKernelLogs=`                    | 244              |
+| `ProtectHostname=`, `RestrictSUIDSGID=` | 242              |
+| `StateDirectory=`, `LockPersonality=`   | 235              |
+
+Below 235 the unit does not work at all: `StateDirectory=` is ignored, `/var/lib/certd` is never created, and
+`certd` cannot write its certificates. That rules out RHEL 7 and SLES 12. Between 235 and 246 the unit runs,
+but the `/proc` restrictions are not in force.
+
+### Installing
+
 ```sh
 sudo certd -install
 ```
