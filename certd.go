@@ -138,6 +138,26 @@ type certState struct {
 	notificationPending bool
 }
 
+// addressDiscovery holds the result of one poll cycle's address discovery.
+// The two sources are tracked separately: a failure in one must neither discard
+// what the other established nor preserve what it disproved.
+type addressDiscovery struct {
+	internalIPs []string
+	// internalComplete reports that internalIPs is authoritative — interface
+	// enumeration succeeded, or internal addresses are disabled entirely.
+	internalComplete bool
+	externalIP       string
+	// externalComplete reports that externalIP is authoritative — it was
+	// detected, carried over from a last known value, or disabled entirely.
+	externalComplete bool
+}
+
+// complete reports whether every enabled source produced an authoritative
+// answer, so the resulting SAN set can be compared against a certificate.
+func (d addressDiscovery) complete() bool {
+	return d.internalComplete && d.externalComplete
+}
+
 // config holds all runtime configuration for the daemon.
 type config struct {
 	algorithms   []algorithm
@@ -322,21 +342,20 @@ func checkAll(
 		return false, fmt.Errorf("getting hostname: %w", err)
 	}
 
-	var internalIPs []string
-	ipSANsComplete := true
+	discovery := addressDiscovery{internalComplete: true, externalComplete: true}
 	if cfg.internalIP {
-		internalIPs, err = getInternalIPs()
+		internalIPs, err := getInternalIPs()
 		if err != nil {
 			logger.Warn("failed to get internal IPs, continuing without them", "err", err)
-			ipSANsComplete = false
+			discovery.internalComplete = false
 		}
+		discovery.internalIPs = internalIPs
 	}
 
-	var externalIP string
 	if cfg.externalIP {
 		// Use the first algorithm's state for the last-known external IP fallback
 		lastKnown := states[cfg.algorithms[0]].externalIP
-		externalIP, err = getExternalIPWithRetry(ctx, cfg.maxRetries, logger)
+		externalIP, err := getExternalIPWithRetry(ctx, cfg.maxRetries, logger)
 		if err != nil {
 			logger.Warn("could not determine external IP, using last known value",
 				"lastKnown", lastKnown,
@@ -344,9 +363,10 @@ func checkAll(
 			)
 			externalIP = lastKnown
 			if externalIP == "" {
-				ipSANsComplete = false
+				discovery.externalComplete = false
 			}
 		}
+		discovery.externalIP = externalIP
 	}
 
 	// Process each algorithm independently — errors are logged but don't stop others.
@@ -364,9 +384,7 @@ func checkAll(
 			st,
 			store,
 			hostname,
-			internalIPs,
-			externalIP,
-			ipSANsComplete,
+			discovery,
 		); err != nil {
 			allSuccessful = false
 			store.recordError(alg, err)
@@ -408,10 +426,13 @@ func checkOne(
 	st *certState,
 	store *statusStore,
 	hostname string,
-	internalIPs []string,
-	externalIP string,
-	ipSANsComplete bool,
+	d addressDiscovery,
 ) error {
+	// Captured before any issuance overwrites it: the internal addresses this
+	// process last observed, used to tell a departed address from an
+	// unconfirmed one when discovery is incomplete.
+	previousInternalIPs := st.internalIPs
+
 	notify := func() error {
 		if err := touchNotifyFile(logger, paths.notify); err != nil {
 			st.notificationPending = true
@@ -421,13 +442,21 @@ func checkOne(
 		return nil
 	}
 
-	issueAndNotify := func(reason string) error {
+	// The IP SANs a certificate issued right now would carry. Every branch below
+	// resolves this exactly once, and both the comparison and the issuance use
+	// that one answer, so the two can never disagree about what belongs in the
+	// certificate.
+	resolveIPs := func() []net.IP {
+		return issuanceIPAddresses(logger, paths.cert, d, previousInternalIPs)
+	}
+
+	issueAndNotify := func(reason string, ipAddresses []net.IP) error {
 		logger.Info("issuing certificate", "reason", reason)
-		if err := issueCert(logger, cfg, alg, paths, hostname, internalIPs, externalIP); err != nil {
+		if err := issueCert(logger, cfg, alg, paths, hostname, ipAddresses); err != nil {
 			return err
 		}
 		store.recordRenewal(alg)
-		updateState(st, hostname, internalIPs, externalIP)
+		updateState(st, hostname, d)
 		// Update status from freshly written cert
 		if cert, err := loadCert(paths.cert); err == nil {
 			store.setOK(alg, cert)
@@ -436,52 +465,55 @@ func checkOne(
 		return notify()
 	}
 
-	// Case 1: cert or key missing
+	// Case: cert or key missing
 	if !fileExists(paths.cert) || !fileExists(paths.key) {
-		return issueAndNotify("missing")
+		return issueAndNotify("missing", resolveIPs())
 	}
 
-	// Parse the existing certificate and verify that its private key matches the
-	// certificate and the algorithm selected for this path.
+	// Case: invalid certificate/key pair. Parse the existing certificate and
+	// verify that its private key matches the certificate and the algorithm
+	// selected for this path.
 	cert, err := loadCertificateKeyPair(paths, alg)
 	if err != nil {
 		logger.Warn("existing certificate/key pair is invalid, re-issuing", "err", err)
-		return issueAndNotify("invalid certificate/key pair")
+		return issueAndNotify("invalid certificate/key pair", resolveIPs())
 	}
 
 	// Update store with current cert state
 	store.setOK(alg, cert)
 
-	// Case 2: hostname changed (or cert does not include current hostname)
+	// Case: hostname changed (or cert does not include current hostname)
 	if cert.Subject.CommonName != hostname || !stringSliceContains(cert.DNSNames, hostname) {
 		logger.Info("hostname changed", "old", cert.Subject.CommonName, "new", hostname)
-		return issueAndNotify("hostname changed")
+		return issueAndNotify("hostname changed", resolveIPs())
 	}
 
-	// Case 3: IP SANs differ from the addresses currently assigned to the host.
-	// Compare with the certificate itself so changes that happened while certd was
-	// stopped are detected on the first poll after startup. If address discovery
-	// was incomplete, retain the existing certificate until a later poll can make
-	// a complete comparison.
-	if ipSANsComplete {
-		desiredIPs := certificateIPAddresses(internalIPs, externalIP)
-		if !ipAddressSetsEqual(cert.IPAddresses, desiredIPs) {
-			logger.Info(
-				"certificate IP SANs changed",
-				"old", ipAddressesToStrings(cert.IPAddresses),
-				"new", ipAddressesToStrings(desiredIPs),
-			)
-			return issueAndNotify("IP SANs changed")
-		}
+	// Case: IP SANs differ from what this host would be issued now. Comparing
+	// against the resolved issuance set rather than against raw discovery results
+	// means a source that did answer is still acted on when the other did not:
+	// interface enumeration is a local syscall that all but always succeeds,
+	// while external detection needs the internet and routinely fails, and
+	// gating both on one flag left an offline host blind to its own address
+	// changes until a renewal happened to fall due. Addresses this cycle could
+	// not confirm are carried over by issuanceIPAddresses and so compare equal,
+	// which is what keeps an incomplete cycle from reissuing on every poll.
+	issueIPs := resolveIPs()
+	if !ipAddressSetsEqual(cert.IPAddresses, issueIPs) {
+		logger.Info(
+			"certificate IP SANs changed",
+			"old", ipAddressesToStrings(cert.IPAddresses),
+			"new", ipAddressesToStrings(issueIPs),
+		)
+		return issueAndNotify("IP SANs changed", issueIPs)
 	}
 
-	// Case 4: renewal due
+	// Case: renewal due
 	if needsRenewal(cert, renewThreshold) {
 		logger.Info("certificate approaching expiry",
 			"notAfter", cert.NotAfter,
 			"remaining", time.Until(cert.NotAfter).Round(time.Hour),
 		)
-		return issueAndNotify("renewal due")
+		return issueAndNotify("renewal due", issueIPs)
 	}
 
 	staleNotification := false
@@ -497,7 +529,7 @@ func checkOne(
 	}
 
 	// No action needed — update state on first successful poll
-	updateState(st, hostname, internalIPs, externalIP)
+	updateState(st, hostname, d)
 	logger.Info("certificate is valid, no action needed",
 		"subject", cert.Subject.CommonName,
 		"notAfter", cert.NotAfter,
@@ -522,17 +554,15 @@ func issueCert(
 	alg algorithm,
 	paths certPaths,
 	hostname string,
-	internalIPs []string,
-	externalIP string,
+	ipAddresses []net.IP,
 ) error {
 	logger.Info("issuing certificate",
 		"hostname", hostname,
-		"internalIPs", internalIPs,
-		"externalIP", externalIP,
+		"ipSANs", ipAddressesToStrings(ipAddresses),
 		"lifetime", cfg.lifetime,
 	)
 
-	certDER, keyPEM, err := generateCert(alg, cfg, hostname, internalIPs, externalIP)
+	certDER, keyPEM, err := generateCert(alg, cfg, hostname, ipAddresses)
 	if err != nil {
 		return fmt.Errorf("generating certificate: %w", err)
 	}
@@ -554,9 +584,7 @@ func issueCert(
 }
 
 // generateCert builds the x509 template and dispatches to the right key generator.
-func generateCert(alg algorithm, cfg *config, hostname string, internalIPs []string, externalIP string) (certDER []byte, keyPEM []byte, err error) {
-	ipAddresses := certificateIPAddresses(internalIPs, externalIP)
-
+func generateCert(alg algorithm, cfg *config, hostname string, ipAddresses []net.IP) (certDER []byte, keyPEM []byte, err error) {
 	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
 		return nil, nil, fmt.Errorf("generating serial number: %w", err)
@@ -909,10 +937,18 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-func updateState(st *certState, hostname string, internalIPs []string, externalIP string) {
+// updateState records this cycle's observations. Only authoritative results are
+// stored: a failed discovery must not erase what an earlier cycle established,
+// because that record is what lets a later issuance tell an address that has
+// gone away from one this cycle simply could not confirm.
+func updateState(st *certState, hostname string, d addressDiscovery) {
 	st.hostname = hostname
-	st.internalIPs = internalIPs
-	st.externalIP = externalIP
+	if d.internalComplete {
+		st.internalIPs = d.internalIPs
+	}
+	if d.externalComplete {
+		st.externalIP = d.externalIP
+	}
 }
 
 func certificateIPAddresses(internalIPs []string, externalIP string) []net.IP {
@@ -938,6 +974,97 @@ func certificateIPAddresses(internalIPs []string, externalIP string) []net.IP {
 		ips = append(ips, ip)
 	}
 	return ips
+}
+
+// issuanceIPAddresses returns the IP SANs to embed in a certificate that is
+// about to be issued. When address discovery succeeded, that is exactly what
+// was discovered. When it did not, issuing with only the addresses that were
+// found would silently drop the rest — including from certificates reissued
+// for an unrelated reason such as a hostname change or a due renewal — so the
+// SANs of the existing certificate that this cycle could not confirm are
+// retained alongside them. The next poll with complete discovery reconciles
+// the set.
+func issuanceIPAddresses(
+	logger *slog.Logger,
+	certPath string,
+	d addressDiscovery,
+	previousInternalIPs []string,
+) []net.IP {
+	discovered := certificateIPAddresses(d.internalIPs, d.externalIP)
+	if d.complete() {
+		return discovered
+	}
+
+	existing, err := loadCert(certPath)
+	if err != nil {
+		logger.Warn("address discovery incomplete and no usable certificate to retain IP SANs from, "+
+			"the new certificate may be missing addresses",
+			"ipSANs", ipAddressesToStrings(discovered),
+			"err", err,
+		)
+		return discovered
+	}
+
+	merged := mergeIPAddresses(discovered, retainableIPAddresses(existing.IPAddresses, d, previousInternalIPs))
+	if !ipAddressSetsEqual(merged, discovered) {
+		logger.Warn("address discovery incomplete, retaining unconfirmed IP SANs from the existing certificate",
+			"discovered", ipAddressesToStrings(discovered),
+			"ipSANs", ipAddressesToStrings(merged),
+		)
+	}
+	return merged
+}
+
+// retainableIPAddresses returns the addresses of an existing certificate that
+// this cycle could not confirm, and which must therefore be carried over into a
+// reissued certificate. An address that a working source positively contradicts
+// is not retained: one that an earlier cycle recorded on a local interface, and
+// that successful enumeration no longer reports, has gone away rather than
+// merely being unconfirmed. Without that distinction a host whose external IP
+// detection is permanently failing would accumulate every internal address it
+// ever held, since no later poll could ever prune them.
+func retainableIPAddresses(existing []net.IP, d addressDiscovery, previousInternalIPs []string) []net.IP {
+	var departed map[string]struct{}
+	if d.internalComplete {
+		departed = make(map[string]struct{}, len(previousInternalIPs))
+		for _, raw := range previousInternalIPs {
+			if ip := net.ParseIP(raw); ip != nil {
+				departed[ip.String()] = struct{}{}
+			}
+		}
+		for _, raw := range d.internalIPs {
+			if ip := net.ParseIP(raw); ip != nil {
+				delete(departed, ip.String())
+			}
+		}
+	}
+
+	retained := make([]net.IP, 0, len(existing))
+	for _, ip := range existing {
+		if _, gone := departed[ip.String()]; gone {
+			continue
+		}
+		retained = append(retained, ip)
+	}
+	return retained
+}
+
+// mergeIPAddresses returns the union of two address lists, preserving the order
+// of primary and appending the addresses of extra that it does not contain.
+func mergeIPAddresses(primary, extra []net.IP) []net.IP {
+	seen := make(map[string]struct{}, len(primary)+len(extra))
+	merged := make([]net.IP, 0, len(primary)+len(extra))
+	for _, list := range [][]net.IP{primary, extra} {
+		for _, ip := range list {
+			canonical := ip.String()
+			if _, exists := seen[canonical]; exists {
+				continue
+			}
+			seen[canonical] = struct{}{}
+			merged = append(merged, ip)
+		}
+	}
+	return merged
 }
 
 func ipAddressSetsEqual(a, b []net.IP) bool {
