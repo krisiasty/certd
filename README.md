@@ -123,6 +123,12 @@ When `CERTD_EXTERNAL_IP=true`, `certd` queries several external IP providers in 
 If all providers fail, `certd` falls back to the last known external IP and logs a warning.
 The certificate is only re-issued if the IP actually changes.
 
+If address discovery is incomplete, the SAN comparison is deferred and the existing certificate is kept.
+Discovery is incomplete when interface enumeration fails, or when no external IP is available and none is known.
+If a re-issue is needed meanwhile for another reason, such as a hostname change or approaching expiry,
+the IP SANs of the existing certificate are carried over so that no address is silently dropped.
+The set is reconciled on the next poll with complete discovery.
+
 ## Integrating dependent services
 
 `certd` uses a notification file mechanism to signal dependent services when a certificate has been issued or renewed.

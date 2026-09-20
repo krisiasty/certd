@@ -421,9 +421,15 @@ func checkOne(
 		return nil
 	}
 
+	// IP SANs discovered during this cycle. When discovery was incomplete this
+	// set is widened at issuance time with the SANs already present in the
+	// existing certificate — see issuanceIPAddresses.
+	discoveredIPs := certificateIPAddresses(internalIPs, externalIP)
+
 	issueAndNotify := func(reason string) error {
 		logger.Info("issuing certificate", "reason", reason)
-		if err := issueCert(logger, cfg, alg, paths, hostname, internalIPs, externalIP); err != nil {
+		ipAddresses := issuanceIPAddresses(logger, paths.cert, discoveredIPs, ipSANsComplete)
+		if err := issueCert(logger, cfg, alg, paths, hostname, ipAddresses); err != nil {
 			return err
 		}
 		store.recordRenewal(alg)
@@ -464,12 +470,11 @@ func checkOne(
 	// was incomplete, retain the existing certificate until a later poll can make
 	// a complete comparison.
 	if ipSANsComplete {
-		desiredIPs := certificateIPAddresses(internalIPs, externalIP)
-		if !ipAddressSetsEqual(cert.IPAddresses, desiredIPs) {
+		if !ipAddressSetsEqual(cert.IPAddresses, discoveredIPs) {
 			logger.Info(
 				"certificate IP SANs changed",
 				"old", ipAddressesToStrings(cert.IPAddresses),
-				"new", ipAddressesToStrings(desiredIPs),
+				"new", ipAddressesToStrings(discoveredIPs),
 			)
 			return issueAndNotify("IP SANs changed")
 		}
@@ -522,17 +527,15 @@ func issueCert(
 	alg algorithm,
 	paths certPaths,
 	hostname string,
-	internalIPs []string,
-	externalIP string,
+	ipAddresses []net.IP,
 ) error {
 	logger.Info("issuing certificate",
 		"hostname", hostname,
-		"internalIPs", internalIPs,
-		"externalIP", externalIP,
+		"ipSANs", ipAddressesToStrings(ipAddresses),
 		"lifetime", cfg.lifetime,
 	)
 
-	certDER, keyPEM, err := generateCert(alg, cfg, hostname, internalIPs, externalIP)
+	certDER, keyPEM, err := generateCert(alg, cfg, hostname, ipAddresses)
 	if err != nil {
 		return fmt.Errorf("generating certificate: %w", err)
 	}
@@ -554,9 +557,7 @@ func issueCert(
 }
 
 // generateCert builds the x509 template and dispatches to the right key generator.
-func generateCert(alg algorithm, cfg *config, hostname string, internalIPs []string, externalIP string) (certDER []byte, keyPEM []byte, err error) {
-	ipAddresses := certificateIPAddresses(internalIPs, externalIP)
-
+func generateCert(alg algorithm, cfg *config, hostname string, ipAddresses []net.IP) (certDER []byte, keyPEM []byte, err error) {
 	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
 		return nil, nil, fmt.Errorf("generating serial number: %w", err)
@@ -938,6 +939,56 @@ func certificateIPAddresses(internalIPs []string, externalIP string) []net.IP {
 		ips = append(ips, ip)
 	}
 	return ips
+}
+
+// issuanceIPAddresses returns the IP SANs to embed in a certificate that is
+// about to be issued. When address discovery succeeded, that is exactly what
+// was discovered. When it did not, issuing with only the addresses that were
+// found would silently drop the rest — including from certificates reissued
+// for an unrelated reason such as a hostname change or a due renewal — so the
+// SANs already present in the existing certificate are retained alongside
+// them. The next poll with complete discovery reconciles the set.
+func issuanceIPAddresses(logger *slog.Logger, certPath string, discovered []net.IP, complete bool) []net.IP {
+	if complete {
+		return discovered
+	}
+
+	existing, err := loadCert(certPath)
+	if err != nil {
+		logger.Warn("address discovery incomplete and no usable certificate to retain IP SANs from, "+
+			"the new certificate may be missing addresses",
+			"ipSANs", ipAddressesToStrings(discovered),
+			"err", err,
+		)
+		return discovered
+	}
+
+	merged := mergeIPAddresses(discovered, existing.IPAddresses)
+	if !ipAddressSetsEqual(merged, discovered) {
+		logger.Warn("address discovery incomplete, retaining IP SANs from the existing certificate",
+			"discovered", ipAddressesToStrings(discovered),
+			"ipSANs", ipAddressesToStrings(merged),
+		)
+	}
+	return merged
+}
+
+// mergeIPAddresses returns the union of two address lists, preserving the order
+// of primary and appending the addresses of extra that it does not contain.
+func mergeIPAddresses(primary, extra []net.IP) []net.IP {
+	seen := make(map[string]struct{}, len(primary)+len(extra))
+	merged := make([]net.IP, 0, len(primary)+len(extra))
+	for _, list := range [][]net.IP{primary, extra} {
+		for _, ip := range list {
+			canonical := ip.String()
+			if _, exists := seen[canonical]; exists {
+				continue
+			}
+			seen[canonical] = struct{}{}
+			merged = append(merged, ip)
+		}
+	}
+	return merged
 }
 
 func ipAddressSetsEqual(a, b []net.IP) bool {
