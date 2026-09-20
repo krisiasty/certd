@@ -69,7 +69,9 @@ Environment=CERTD_EXTERNAL_IP=false
 | `CERTD_CERT_DIR`       | `-cert-dir`       | `/var/lib/certd`      | Directory where certificate and key files are written                                                            |
 | `CERTD_NOTIFY_DIR`     | `-notify-dir`     | `/run/certd`          | Directory where notification files are written after a certificate is issued or renewed                          |
 | `CERTD_INTERNAL_IP`    | `-internal-ip`    | `false`               | Include non-loopback IPv4 addresses of local interfaces in certificate SANs                                      |
+| `CERTD_INTERFACES`     | `-interfaces`     | `default-route`       | Interfaces to take internal IPs from: `default-route`, `all`, or a list of interface names                       |
 | `CERTD_EXTERNAL_IP`    | `-external-ip`    | `false`               | Detect and include the external (NAT) IPv4 address in certificate SANs                                           |
+| `CERTD_EXTRA_SANS`     | `-extra-sans`     | —                     | Extra subject alternative names, comma separated: IP addresses or DNS names, always certified                    |
 | `CERTD_POLL_INTERVAL`  | `-poll-interval`  | `1h`                  | How often to check for hostname/IP changes and certificate expiry                                                |
 | `CERTD_MAX_RETRIES`    | `-max-retries`    | `5`                   | Maximum number of retries for external IP detection, with exponential backoff                                    |
 | `CERTD_HTTP_ADDR`      | `-http-addr`      | `127.0.0.1:8484`      | Address for the HTTP health and metrics server. Set to empty string to disable                                   |
@@ -154,7 +156,28 @@ Every certificate always includes the following Subject Alternative Names:
 - `localhost`
 - `127.0.0.1`
 
-When `CERTD_INTERNAL_IP=true`, all non-loopback IPv4 addresses of active network interfaces are also added.
+When `CERTD_INTERNAL_IP=true`, the host's own IPv4 addresses are added. By default they are taken from the
+interface carrying the default route, which keeps container and virtual bridges such as `docker0`, `br-*` and
+`virbr0` out of the certificate. Those appear and disappear as containers and networks are created and removed,
+and every change would re-issue the certificate and restart each dependent service.
+
+`CERTD_INTERFACES` selects where the addresses come from, and defaults to `default-route`:
+
+| Value           | Meaning                                                                          |
+|-----------------|----------------------------------------------------------------------------------|
+| `default-route` | The interface carrying the default route. This is also what an empty value means |
+| `all`           | Every non-loopback interface                                                     |
+| `eth0,eth1`     | Exactly the interfaces named                                                     |
+
+A host that serves on more than one network needs `all` or an explicit list, or the addresses on its other
+networks are left out of the certificate.
+
+A host with no default route at all — air-gapped, on an isolated segment, or with a lapsed DHCP lease — falls
+back to every non-loopback interface and logs a warning.
+
+Link-local addresses (`169.254.0.0/16`) are never included. A host assigns itself one when DHCP fails, so
+including it would re-issue the certificate when the lease is lost and again when it returns, each time to name
+an address nothing can reach the host on.
 
 When `CERTD_EXTERNAL_IP=true`, `certd` queries several external IP providers in order and adds the first valid IPv4 response:
 
@@ -173,6 +196,30 @@ while an address a working source contradicts is still removed.
 An address that enumeration no longer reports is therefore dropped even while external detection is failing,
 and an interface change is still acted on by a host with no internet access at all.
 The set is reconciled on the next poll with complete discovery.
+
+### Additional names and addresses
+
+`CERTD_EXTRA_SANS` adds subject alternative names that are always certified, whether or not this host holds
+them. Entries that parse as IP addresses become IP SANs and the rest become DNS SANs; anything that is neither
+is rejected at startup, so a mistyped address is not quietly certified as a host name.
+
+```sh
+CERTD_EXTRA_SANS=10.0.0.100,vip.example.com,*.apps.example.com
+```
+
+This is how to certify a floating address. A VRRP or Pacemaker VIP exists only on the node currently holding it,
+so detection would place it in that node's certificate alone — and at failover the node taking over would serve
+a certificate that is not valid for the address clients are connecting to, until its next poll re-issued the
+certificate and restarted the service. Configuring the address instead puts it in every node's certificate
+permanently, so a failover changes nothing and triggers no re-issue on either node.
+
+It is also the only way to certify an address the host cannot see at all. An AWS Elastic IP or an OpenStack
+floating IP is translated by the network and never appears on an interface, so no amount of detection will find
+it.
+
+Names and addresses are deduplicated and sorted, so two certificates issued from the same configuration list
+their SANs identically. Combined with `CERTD_INTERNAL_IP=false` and `CERTD_EXTERNAL_IP=false`, this gives
+certificates whose contents are entirely determined by configuration, with no detection at all.
 
 ## Integrating dependent services
 

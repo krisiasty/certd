@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -89,6 +90,27 @@ func TestRunRejectsInvalidConfigBeforeSideEffects(t *testing.T) {
 				cfg.pollInterval = maxPollInterval + time.Minute
 			},
 			wantError: "poll interval must be between",
+		},
+		{
+			name: "interface selection mixes all with names",
+			configure: func(cfg *config) {
+				cfg.interfaces = []string{interfacesAll, "eth0"}
+			},
+			wantError: "combines",
+		},
+		{
+			name: "interface selection mixes default-route with names",
+			configure: func(cfg *config) {
+				cfg.interfaces = []string{interfacesDefaultRoute, "eth0"}
+			},
+			wantError: "combines",
+		},
+		{
+			name: "interface selection combines both keywords",
+			configure: func(cfg *config) {
+				cfg.interfaces = []string{interfacesAll, interfacesDefaultRoute}
+			},
+			wantError: "combines",
 		},
 		{
 			name: "more retries than permitted",
@@ -290,12 +312,12 @@ func TestCheckOneReissuesMismatchedCertificateKeyPair(t *testing.T) {
 
 	cfg, paths, logger := newTestCertificateConfig(t, false, false)
 	const hostname = "host.example.test"
-	if err := issueCert(logger, cfg, algorithmECDSA, paths, hostname, certificateIPAddresses(nil, "")); err != nil {
+	if err := issueCert(logger, cfg, algorithmECDSA, paths, hostname, certificateIPAddresses(nil, "", nil)); err != nil {
 		t.Fatalf("issue initial certificate: %v", err)
 	}
 	initial := loadTestCertificate(t, paths.cert)
 
-	_, replacementKey, err := generateCert(algorithmECDSA, cfg, hostname, certificateIPAddresses(nil, ""))
+	_, replacementKey, err := generateCert(algorithmECDSA, cfg, hostname, certificateIPAddresses(nil, "", nil))
 	if err != nil {
 		t.Fatalf("generate mismatched key: %v", err)
 	}
@@ -330,7 +352,7 @@ func TestCheckOneReissuesCertificateWithWrongAlgorithm(t *testing.T) {
 
 	cfg, paths, logger := newTestCertificateConfig(t, false, false)
 	const hostname = "host.example.test"
-	if err := issueCert(logger, cfg, algorithmEd25519, paths, hostname, certificateIPAddresses(nil, "")); err != nil {
+	if err := issueCert(logger, cfg, algorithmEd25519, paths, hostname, certificateIPAddresses(nil, "", nil)); err != nil {
 		t.Fatalf("issue certificate with wrong algorithm: %v", err)
 	}
 
@@ -369,7 +391,7 @@ func TestIssueCertAtomicallyReplacesFilesAndModes(t *testing.T) {
 		}
 	}
 
-	if err := issueCert(logger, cfg, algorithmECDSA, paths, "host.example.test", certificateIPAddresses(nil, "")); err != nil {
+	if err := issueCert(logger, cfg, algorithmECDSA, paths, "host.example.test", certificateIPAddresses(nil, "", nil)); err != nil {
 		t.Fatalf("replace certificate/key pair: %v", err)
 	}
 	if _, err := loadCertificateKeyPair(paths, algorithmECDSA); err != nil {
@@ -455,7 +477,7 @@ func TestCheckOneRecoversMissedNotificationAfterRestart(t *testing.T) {
 
 	cfg, paths, logger := newTestCertificateConfig(t, false, false)
 	const hostname = "host.example.test"
-	if err := issueCert(logger, cfg, algorithmECDSA, paths, hostname, certificateIPAddresses(nil, "")); err != nil {
+	if err := issueCert(logger, cfg, algorithmECDSA, paths, hostname, certificateIPAddresses(nil, "", nil)); err != nil {
 		t.Fatalf("issue initial certificate: %v", err)
 	}
 	issued := loadTestCertificate(t, paths.cert)
@@ -525,7 +547,7 @@ func TestCheckOneReissuesForIPSANChangesAfterRestart(t *testing.T) {
 				algorithmECDSA,
 				paths,
 				hostname,
-				certificateIPAddresses(tt.oldInternal, tt.oldExternal),
+				certificateIPAddresses(tt.oldInternal, tt.oldExternal, nil),
 			); err != nil {
 				t.Fatalf("issue initial certificate: %v", err)
 			}
@@ -550,7 +572,7 @@ func TestCheckOneReissuesForIPSANChangesAfterRestart(t *testing.T) {
 			if before.SerialNumber.Cmp(after.SerialNumber) == 0 {
 				t.Fatal("certificate was not reissued after its IP SANs changed")
 			}
-			desiredIPs := certificateIPAddresses(tt.newInternal, tt.newExternal)
+			desiredIPs := certificateIPAddresses(tt.newInternal, tt.newExternal, nil)
 			if !ipAddressSetsEqual(after.IPAddresses, desiredIPs) {
 				t.Fatalf(
 					"certificate IP SANs = %v, want %v",
@@ -573,7 +595,7 @@ func TestCheckOneKeepsCertificateWhenIncompleteDiscoveryMatchesIt(t *testing.T) 
 		algorithmECDSA,
 		paths,
 		hostname,
-		certificateIPAddresses(nil, "198.51.100.10"),
+		certificateIPAddresses(nil, "198.51.100.10", nil),
 	); err != nil {
 		t.Fatalf("issue initial certificate: %v", err)
 	}
@@ -643,7 +665,7 @@ func TestCheckOneRetainsIPSANsWhenReissuingWithIncompleteDiscovery(t *testing.T)
 				algorithmECDSA,
 				paths,
 				tt.issuedHostname,
-				certificateIPAddresses(internalIPs, externalIP),
+				certificateIPAddresses(internalIPs, externalIP, nil),
 			); err != nil {
 				t.Fatalf("issue initial certificate: %v", err)
 			}
@@ -691,7 +713,7 @@ func TestCheckOneKeepsDiscoveredAndRetainedIPSANsWhenDiscoveryIsPartial(t *testi
 		algorithmECDSA,
 		paths,
 		"old.example.test",
-		certificateIPAddresses([]string{"192.0.2.10"}, "198.51.100.10"),
+		certificateIPAddresses([]string{"192.0.2.10"}, "198.51.100.10", nil),
 	); err != nil {
 		t.Fatalf("issue initial certificate: %v", err)
 	}
@@ -715,6 +737,7 @@ func TestCheckOneKeepsDiscoveredAndRetainedIPSANsWhenDiscoveryIsPartial(t *testi
 	want := certificateIPAddresses(
 		[]string{"192.0.2.10", "192.0.2.20"},
 		"198.51.100.10",
+		nil,
 	)
 	if !ipAddressSetsEqual(after.IPAddresses, want) {
 		t.Fatalf(
@@ -736,7 +759,7 @@ func TestCheckOneDetectsInternalIPChangeWhileExternalDetectionFails(t *testing.T
 		algorithmECDSA,
 		paths,
 		hostname,
-		certificateIPAddresses([]string{"192.0.2.10"}, "198.51.100.10"),
+		certificateIPAddresses([]string{"192.0.2.10"}, "198.51.100.10", nil),
 	); err != nil {
 		t.Fatalf("issue initial certificate: %v", err)
 	}
@@ -762,7 +785,7 @@ func TestCheckOneDetectsInternalIPChangeWhileExternalDetectionFails(t *testing.T
 	if before.SerialNumber.Cmp(after.SerialNumber) == 0 {
 		t.Fatal("certificate was not reissued after an internal IP change")
 	}
-	want := certificateIPAddresses([]string{"192.0.2.20"}, "198.51.100.10")
+	want := certificateIPAddresses([]string{"192.0.2.20"}, "198.51.100.10", nil)
 	if !ipAddressSetsEqual(after.IPAddresses, want) {
 		t.Fatalf(
 			"certificate IP SANs = %v, want %v",
@@ -783,7 +806,7 @@ func TestCheckOneReissuesOnceWhenDiscoveryStaysIncomplete(t *testing.T) {
 		algorithmECDSA,
 		paths,
 		hostname,
-		certificateIPAddresses([]string{"192.0.2.10"}, "198.51.100.10"),
+		certificateIPAddresses([]string{"192.0.2.10"}, "198.51.100.10", nil),
 	); err != nil {
 		t.Fatalf("issue initial certificate: %v", err)
 	}
@@ -824,7 +847,7 @@ func TestCheckOneRemainsStableWhenInterfaceEnumerationFails(t *testing.T) {
 		algorithmECDSA,
 		paths,
 		hostname,
-		certificateIPAddresses([]string{"192.0.2.10"}, "198.51.100.10"),
+		certificateIPAddresses([]string{"192.0.2.10"}, "198.51.100.10", nil),
 	); err != nil {
 		t.Fatalf("issue initial certificate: %v", err)
 	}
@@ -850,6 +873,7 @@ func TestCheckOneRemainsStableWhenInterfaceEnumerationFails(t *testing.T) {
 	want := certificateIPAddresses(
 		[]string{"192.0.2.10", "198.51.100.10"},
 		"198.51.100.20",
+		nil,
 	)
 	if !ipAddressSetsEqual(first.IPAddresses, want) {
 		t.Fatalf(
@@ -875,7 +899,7 @@ func TestCheckOnePrunesDepartedInternalIPWhileExternalDetectionFails(t *testing.
 		algorithmECDSA,
 		paths,
 		"old.example.test",
-		certificateIPAddresses([]string{"192.0.2.10"}, "198.51.100.10"),
+		certificateIPAddresses([]string{"192.0.2.10"}, "198.51.100.10", nil),
 	); err != nil {
 		t.Fatalf("issue initial certificate: %v", err)
 	}
@@ -899,7 +923,7 @@ func TestCheckOnePrunesDepartedInternalIPWhileExternalDetectionFails(t *testing.
 	}
 
 	after := loadTestCertificate(t, paths.cert)
-	want := certificateIPAddresses([]string{"192.0.2.20"}, "198.51.100.10")
+	want := certificateIPAddresses([]string{"192.0.2.20"}, "198.51.100.10", nil)
 	if !ipAddressSetsEqual(after.IPAddresses, want) {
 		t.Fatalf(
 			"certificate IP SANs = %v, want %v",
@@ -927,7 +951,7 @@ func TestCheckOneIssuesMissingCertificateDespiteIncompleteDiscovery(t *testing.T
 	}
 
 	issued := loadTestCertificate(t, paths.cert)
-	want := certificateIPAddresses([]string{"192.0.2.10"}, "")
+	want := certificateIPAddresses([]string{"192.0.2.10"}, "", nil)
 	if !ipAddressSetsEqual(issued.IPAddresses, want) {
 		t.Fatalf(
 			"certificate IP SANs = %v, want %v",
@@ -962,7 +986,7 @@ func TestCheckOneReissuesWhenConfiguredLifetimeChanges(t *testing.T) {
 				algorithmECDSA,
 				paths,
 				hostname,
-				certificateIPAddresses(nil, ""),
+				certificateIPAddresses(nil, "", nil),
 			); err != nil {
 				t.Fatalf("issue initial certificate: %v", err)
 			}
@@ -1005,7 +1029,7 @@ func TestCheckOneReissuesOnceAfterLifetimeChange(t *testing.T) {
 		algorithmECDSA,
 		paths,
 		hostname,
-		certificateIPAddresses(nil, ""),
+		certificateIPAddresses(nil, "", nil),
 	); err != nil {
 		t.Fatalf("issue initial certificate: %v", err)
 	}
@@ -1113,6 +1137,293 @@ func TestGetExternalIPWithRetryWaitsBetweenAttempts(t *testing.T) {
 	}
 	if elapsed > 2*time.Second {
 		t.Fatalf("two attempts took %s; more than one delay was waited", elapsed)
+	}
+}
+
+func TestSplitList(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{name: "empty", input: "", want: nil},
+		{name: "single", input: "eth0", want: []string{"eth0"}},
+		{name: "several", input: "eth0,eth1", want: []string{"eth0", "eth1"}},
+		{name: "spaces around entries", input: " eth0 , eth1 ", want: []string{"eth0", "eth1"}},
+		{name: "trailing comma", input: "eth0,", want: []string{"eth0"}},
+		{name: "only separators", input: " , ", want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := splitList(tt.input)
+			if len(got) != len(tt.want) {
+				t.Fatalf("splitList(%q) = %#v, want %#v", tt.input, got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Fatalf("splitList(%q) = %#v, want %#v", tt.input, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestSelectedInterfaces(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.DiscardHandler)
+
+	if got := selectedInterfaces(t.Context(), []string{interfacesAll}, logger); got != nil {
+		t.Fatalf("selecting %q restricted the interfaces to %v, want every one", interfacesAll, got)
+	}
+
+	got := selectedInterfaces(t.Context(), []string{"eth0", "eth1"}, logger)
+	if len(got) != 2 {
+		t.Fatalf("named selection = %v, want two entries", got)
+	}
+	for _, name := range []string{"eth0", "eth1"} {
+		if _, ok := got[name]; !ok {
+			t.Fatalf("named selection = %v, want it to contain %q", got, name)
+		}
+	}
+}
+
+func TestGetInternalIPsSelectionNarrowsTheResult(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.DiscardHandler)
+
+	all, err := getInternalIPs(t.Context(), []string{interfacesAll}, logger)
+	if err != nil {
+		t.Fatalf("enumerating every interface: %v", err)
+	}
+	if len(all) == 0 {
+		t.Skip("host has no usable IPv4 address to select between")
+	}
+
+	// Following the default route can only ever return a subset of what every
+	// interface offers, whichever interface this host actually routes through.
+	viaDefaultRoute, err := getInternalIPs(t.Context(), nil, logger)
+	if err != nil {
+		t.Fatalf("following the default route: %v", err)
+	}
+	for _, ip := range viaDefaultRoute {
+		if !slices.Contains(all, ip) {
+			t.Fatalf("default route produced %s, which is not among %v", ip, all)
+		}
+	}
+
+	// Naming the default route explicitly must mean the same as leaving the
+	// setting empty, not "an interface called default-route".
+	named, err := getInternalIPs(t.Context(), []string{interfacesDefaultRoute}, logger)
+	if err != nil {
+		t.Fatalf("naming the default route: %v", err)
+	}
+	if len(named) != len(viaDefaultRoute) {
+		t.Fatalf("%q produced %v, want the same as an empty selection, %v",
+			interfacesDefaultRoute, named, viaDefaultRoute)
+	}
+	for i := range named {
+		if named[i] != viaDefaultRoute[i] {
+			t.Fatalf("%q produced %v, want the same as an empty selection, %v",
+				interfacesDefaultRoute, named, viaDefaultRoute)
+		}
+	}
+
+	// An interface that does not exist contributes nothing, and is reported
+	// rather than failing the poll: interfaces can appear later.
+	none, err := getInternalIPs(t.Context(), []string{"certd-absent0"}, logger)
+	if err != nil {
+		t.Fatalf("selecting an absent interface: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("absent interface produced %v, want nothing", none)
+	}
+}
+
+func TestDefaultRouteInterfaceNamesAnInterfaceThatExists(t *testing.T) {
+	t.Parallel()
+
+	name, err := defaultRouteInterface(t.Context())
+	if err != nil {
+		t.Skipf("host has no default route: %v", err)
+	}
+	if _, err := net.InterfaceByName(name); err != nil {
+		t.Fatalf("default route named interface %q, which does not exist: %v", name, err)
+	}
+}
+
+func TestCheckOneCertifiesConfiguredExtraSANs(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	// A floating address this node does not hold, as on the standby member of
+	// a VRRP pair, plus the service name clients actually connect to.
+	cfg.extraIPs = []net.IP{net.ParseIP("10.0.0.100")}
+	cfg.extraDNS = []string{"vip.example.test"}
+
+	if err := checkOne(
+		logger,
+		cfg,
+		algorithmECDSA,
+		paths,
+		&certState{},
+		newStatusStore([]algorithm{algorithmECDSA}),
+		"host.example.test",
+		completeDiscovery(nil, ""),
+	); err != nil {
+		t.Fatalf("check certificate: %v", err)
+	}
+
+	cert := loadTestCertificate(t, paths.cert)
+	if !ipAddressSetsEqual(cert.IPAddresses, certificateIPAddresses(nil, "", cfg.extraIPs)) {
+		t.Fatalf("certificate IP SANs = %v, want the configured address included",
+			ipAddressesToStrings(cert.IPAddresses))
+	}
+	if !slices.Contains(cert.DNSNames, "vip.example.test") {
+		t.Fatalf("certificate DNS SANs = %v, want the configured name included", cert.DNSNames)
+	}
+	if !slices.Contains(cert.DNSNames, "host.example.test") {
+		t.Fatalf("certificate DNS SANs = %v, want the hostname retained", cert.DNSNames)
+	}
+}
+
+func TestCheckOneReissuesWhenExtraSANsChange(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	const hostname = "host.example.test"
+	st := &certState{}
+	store := newStatusStore([]algorithm{algorithmECDSA})
+	check := func(stage string) *x509.Certificate {
+		t.Helper()
+		if err := checkOne(
+			logger, cfg, algorithmECDSA, paths, st, store, hostname, completeDiscovery(nil, ""),
+		); err != nil {
+			t.Fatalf("%s: %v", stage, err)
+		}
+		return loadTestCertificate(t, paths.cert)
+	}
+
+	before := check("initial issuance")
+
+	cfg.extraDNS = []string{"vip.example.test"}
+	after := check("after adding a name")
+	if before.SerialNumber.Cmp(after.SerialNumber) == 0 {
+		t.Fatal("certificate was not reissued after a DNS SAN was configured")
+	}
+	if !slices.Contains(after.DNSNames, "vip.example.test") {
+		t.Fatalf("certificate DNS SANs = %v, want the new name", after.DNSNames)
+	}
+
+	// And settles: an unchanged configuration must not reissue every poll.
+	again := check("second poll")
+	if after.SerialNumber.Cmp(again.SerialNumber) != 0 {
+		t.Fatal("certificate reissued again on an unchanged cycle")
+	}
+
+	cfg.extraDNS = nil
+	removed := check("after removing the name")
+	if again.SerialNumber.Cmp(removed.SerialNumber) == 0 {
+		t.Fatal("certificate was not reissued after a DNS SAN was removed")
+	}
+	if slices.Contains(removed.DNSNames, "vip.example.test") {
+		t.Fatalf("certificate DNS SANs = %v, want the removed name gone", removed.DNSNames)
+	}
+}
+
+func TestClassifyExtraSANs(t *testing.T) {
+	t.Parallel()
+
+	ips, names, err := classifyExtraSANs([]string{
+		"10.0.0.100", "vip.example.test", "2001:db8::1", "*.apps.example.test", "host.example.test.",
+	})
+	if err != nil {
+		t.Fatalf("classifying valid entries: %v", err)
+	}
+	if len(ips) != 2 {
+		t.Fatalf("addresses = %v, want two", ipAddressesToStrings(ips))
+	}
+	if len(names) != 3 {
+		t.Fatalf("names = %v, want three", names)
+	}
+}
+
+func TestClassifyExtraSANsRejectsMalformedEntries(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		entry string
+	}{
+		// Numeric-looking entries are mistyped addresses, not host names. Left
+		// to DNS validation "10.0.0.256" is a syntactically fine name, and
+		// would be certified as one.
+		{name: "octet out of range", entry: "10.0.0.256"},
+		{name: "too many octets", entry: "10.0.0.1.5"},
+		{name: "truncated IPv6", entry: "2001:db8:::1"},
+		{name: "empty label", entry: "host..example.test"},
+		{name: "label starts with a dash", entry: "-host.example.test"},
+		{name: "label ends with a dash", entry: "host-.example.test"},
+		{name: "space in name", entry: "host .example.test"},
+		{name: "underscore in name", entry: "host_name.example.test"},
+		{name: "url rather than a name", entry: "https://host.example.test"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if ips, names, err := classifyExtraSANs([]string{tt.entry}); err == nil {
+				t.Fatalf("classifyExtraSANs(%q) = %v, %v, want an error",
+					tt.entry, ipAddressesToStrings(ips), names)
+			}
+		})
+	}
+}
+
+func TestUsableInternalIP(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		ip   string
+		want bool
+	}{
+		{name: "private address", ip: "192.168.1.10", want: true},
+		{name: "public address", ip: "203.0.113.7", want: true},
+		{name: "container bridge address", ip: "172.17.0.1", want: true},
+		{name: "loopback", ip: "127.0.0.1", want: false},
+		// APIPA. It appears precisely when DHCP has failed and disappears when
+		// it recovers, so including it re-issues the certificate each way while
+		// naming an address nothing can be reached on.
+		{name: "link-local", ip: "169.254.23.45", want: false},
+		{name: "link-local at the edge of the range", ip: "169.254.255.255", want: false},
+		{name: "just below the link-local range", ip: "169.253.255.255", want: true},
+		{name: "IPv6", ip: "2001:db8::1", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ip := net.ParseIP(tt.ip)
+			if ip == nil {
+				t.Fatalf("test address %q does not parse", tt.ip)
+			}
+			if got := usableInternalIP(ip); got != tt.want {
+				t.Fatalf("usableInternalIP(%s) = %t, want %t", tt.ip, got, tt.want)
+			}
+		})
+	}
+
+	if usableInternalIP(nil) {
+		t.Fatal("usableInternalIP(nil) = true, want false")
 	}
 }
 
@@ -1345,10 +1656,11 @@ func readREADMEDefaults(t *testing.T) map[string]string {
 func TestIPAddressSetsEqualIgnoresOrderAndDuplicates(t *testing.T) {
 	t.Parallel()
 
-	a := certificateIPAddresses([]string{"192.0.2.10", "192.0.2.20"}, "198.51.100.10")
+	a := certificateIPAddresses([]string{"192.0.2.10", "192.0.2.20"}, "198.51.100.10", nil)
 	b := certificateIPAddresses(
 		[]string{"192.0.2.20", "192.0.2.10", "192.0.2.10"},
 		"198.51.100.10",
+		nil,
 	)
 	if !ipAddressSetsEqual(a, b) {
 		t.Fatalf("IP sets differ: %v and %v", ipAddressesToStrings(a), ipAddressesToStrings(b))

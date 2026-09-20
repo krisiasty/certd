@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -30,6 +31,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -165,6 +167,9 @@ type config struct {
 	certDir      string
 	notifyDir    string
 	internalIP   bool
+	interfaces   []string
+	extraIPs     []net.IP
+	extraDNS     []string
 	externalIP   bool
 	pollInterval time.Duration
 	maxRetries   int
@@ -212,6 +217,19 @@ const (
 	// same twenty retries cost four and a half minutes. The default of five
 	// never reaches the cap, so its schedule is unchanged.
 	maxBackoff = 16 * time.Second
+
+	// interfacesAll selects every non-loopback interface, which is what certd
+	// did before it learned to follow the default route. interfacesDefaultRoute
+	// names the default behaviour, so a unit file can state which it relies on
+	// rather than leaving the setting empty and implying it.
+	interfacesAll          = "all"
+	interfacesDefaultRoute = "default-route"
+
+	// defaultRouteProbe is in TEST-NET-1 (RFC 5737), reserved for documentation
+	// and never routed anywhere. Connecting a UDP socket to it transmits
+	// nothing; it only asks the kernel which route, and so which source
+	// address, the host would use to reach somewhere off-link.
+	defaultRouteProbe = "192.0.2.1:9"
 
 	defaultRSA        = false
 	defaultECDSA      = false
@@ -270,6 +288,8 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 		"certDir", cfg.certDir,
 		"notifyDir", cfg.notifyDir,
 		"internalIP", cfg.internalIP,
+		"interfaces", interfaceSelectionText(cfg.interfaces),
+		"extraSANs", strings.Join(append(ipAddressesToStrings(cfg.extraIPs), cfg.extraDNS...), ","),
 		"externalIP", cfg.externalIP,
 		"pollInterval", cfg.pollInterval,
 		"maxRetries", cfg.maxRetries,
@@ -378,6 +398,14 @@ func validateConfig(cfg *config) error {
 			time.Duration(float64(cfg.pollInterval)/renewThreshold).Round(time.Second),
 		)
 	}
+	for _, keyword := range []string{interfacesAll, interfacesDefaultRoute} {
+		if len(cfg.interfaces) > 1 && slices.Contains(cfg.interfaces, keyword) {
+			return fmt.Errorf(
+				"interface selection %q combines %q with other entries; use %q on its own, or name interfaces",
+				strings.Join(cfg.interfaces, ","), keyword, keyword,
+			)
+		}
+	}
 	// Both retry bounds are conditional because cfg.maxRetries has exactly one
 	// consumer, getExternalIPWithRetry, and that is only reached when external
 	// IP detection is enabled. With it off nothing retries and nothing waits,
@@ -418,7 +446,7 @@ func checkAll(
 
 	discovery := addressDiscovery{internalComplete: true, externalComplete: true}
 	if cfg.internalIP {
-		internalIPs, err := getInternalIPs()
+		internalIPs, err := getInternalIPs(ctx, cfg.interfaces, logger)
 		if err != nil {
 			logger.Warn("failed to get internal IPs, continuing without them", "err", err)
 			discovery.internalComplete = false
@@ -521,7 +549,7 @@ func checkOne(
 	// that one answer, so the two can never disagree about what belongs in the
 	// certificate.
 	resolveIPs := func() []net.IP {
-		return issuanceIPAddresses(logger, paths.cert, d, previousInternalIPs)
+		return issuanceIPAddresses(logger, paths.cert, d, previousInternalIPs, cfg.extraIPs)
 	}
 
 	issueAndNotify := func(reason string, ipAddresses []net.IP) error {
@@ -556,10 +584,19 @@ func checkOne(
 	// Update store with current cert state
 	store.setOK(alg, cert)
 
-	// Case: hostname changed (or cert does not include current hostname)
-	if cert.Subject.CommonName != hostname || !stringSliceContains(cert.DNSNames, hostname) {
+	// Case: hostname changed
+	if cert.Subject.CommonName != hostname {
 		logger.Info("hostname changed", "old", cert.Subject.CommonName, "new", hostname)
 		return issueAndNotify("hostname changed", resolveIPs())
+	}
+
+	// Case: DNS SANs differ from what this host would be issued now. Comparing
+	// the whole set rather than only checking that the hostname appears is what
+	// makes a change to the configured names take effect; a containment check
+	// would never notice one being added or removed.
+	if desiredDNS := certificateDNSNames(hostname, cfg.extraDNS); !stringSetsEqual(cert.DNSNames, desiredDNS) {
+		logger.Info("certificate DNS SANs changed", "old", cert.DNSNames, "new", desiredDNS)
+		return issueAndNotify("DNS SANs changed", resolveIPs())
 	}
 
 	// Case: IP SANs differ from what this host would be issued now. Comparing
@@ -680,7 +717,7 @@ func generateCert(alg algorithm, cfg *config, hostname string, ipAddresses []net
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject:      pkix.Name{CommonName: hostname},
-		DNSNames:     []string{hostname, "localhost"},
+		DNSNames:     certificateDNSNames(hostname, cfg.extraDNS),
 		IPAddresses:  ipAddresses,
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(cfg.lifetime),
@@ -748,36 +785,204 @@ func generateEd25519(template *x509.Certificate) ([]byte, []byte, error) {
 	return certDER, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), nil
 }
 
-// getInternalIPs returns all non-loopback IPv4 addresses on the host.
-func getInternalIPs() ([]string, error) {
+// numericSAN matches an entry made only of the characters an IP address uses.
+// One that fails to parse is a mistyped address rather than a host name, and is
+// rejected instead of being quietly certified as a DNS name.
+var numericSAN = regexp.MustCompile(`^[0-9.:]+$`)
+
+// classifyExtraSANs splits configured subject alternative names into addresses
+// and host names. An entry that parses as an IP becomes an IP SAN; anything
+// else must be a syntactically valid DNS name.
+func classifyExtraSANs(entries []string) ([]net.IP, []string, error) {
+	var ips []net.IP
+	var names []string
+	for _, entry := range entries {
+		if ip := net.ParseIP(entry); ip != nil {
+			ips = append(ips, ip)
+			continue
+		}
+		if numericSAN.MatchString(entry) {
+			return nil, nil, fmt.Errorf("%q is not a valid IP address", entry)
+		}
+		if !validDNSName(entry) {
+			return nil, nil, fmt.Errorf("%q is not a valid IP address or DNS name", entry)
+		}
+		names = append(names, entry)
+	}
+	return ips, names, nil
+}
+
+// validDNSName reports whether a name can be used as a DNS subject alternative
+// name. A leading "*." is accepted, since a wildcard covers the leftmost label.
+func validDNSName(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	name = strings.TrimSuffix(name, ".")
+	if rest, found := strings.CutPrefix(name, "*."); found {
+		name = rest
+	}
+	if name == "" {
+		return false
+	}
+	for label := range strings.SplitSeq(name, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// addressIP extracts the IP from an interface address, or nil if it carries none.
+func addressIP(addr net.Addr) net.IP {
+	switch v := addr.(type) {
+	case *net.IPNet:
+		return v.IP
+	case *net.IPAddr:
+		return v.IP
+	default:
+		return nil
+	}
+}
+
+// usableInternalIP reports whether an address belongs in a certificate.
+// Link-local addresses do not: 169.254/16 is what a host assigns itself when
+// DHCP has failed, so it appears when the lease is lost and disappears when it
+// returns, re-issuing the certificate each way to name an address that nothing
+// can reach the host on.
+func usableInternalIP(ip net.IP) bool {
+	return ip != nil && ip.To4() != nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast()
+}
+
+// defaultRouteInterface returns the interface carrying the host's default
+// route, the one it would use to reach anything not on a local network.
+//
+// A connected UDP socket transmits nothing: the kernel resolves the route and
+// picks the source address it would use, and that address identifies the
+// interface. An error means the host has no default route — an isolated
+// network, or a lapsed DHCP lease.
+func defaultRouteInterface(ctx context.Context) (string, error) {
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "udp", defaultRouteProbe)
+	if err != nil {
+		return "", fmt.Errorf("resolving default route: %w", err)
+	}
+	local, ok := conn.LocalAddr().(*net.UDPAddr)
+	if closeErr := conn.Close(); closeErr != nil {
+		return "", fmt.Errorf("closing default route probe: %w", closeErr)
+	}
+	if !ok || local.IP == nil {
+		return "", errors.New("default route probe reported no source address")
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("listing interfaces: %w", err)
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return "", fmt.Errorf("listing addresses of %s: %w", iface.Name, err)
+		}
+		for _, addr := range addrs {
+			if ip := addressIP(addr); ip != nil && ip.Equal(local.IP) {
+				return iface.Name, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no interface holds the default route source address %s", local.IP)
+}
+
+// selectedInterfaces resolves the configured selection to the interface names
+// whose addresses belong in the certificate, or nil when every non-loopback
+// interface qualifies.
+func selectedInterfaces(ctx context.Context, selection []string, logger *slog.Logger) map[string]struct{} {
+	if len(selection) == 1 && selection[0] == interfacesAll {
+		return nil
+	}
+	if !followsDefaultRoute(selection) {
+		set := make(map[string]struct{}, len(selection))
+		for _, name := range selection {
+			set[name] = struct{}{}
+		}
+		return set
+	}
+
+	name, err := defaultRouteInterface(ctx)
+	if err != nil {
+		// Without a default route there is nothing to follow, so fall back to
+		// what certd did before: every non-loopback interface. Issuing a
+		// certificate with no addresses at all would be worse.
+		logger.Warn("no default route, falling back to every non-loopback interface", "err", err)
+		return nil
+	}
+	return map[string]struct{}{name: {}}
+}
+
+// getInternalIPs returns the IPv4 addresses of the selected interfaces.
+func getInternalIPs(ctx context.Context, selection []string, logger *slog.Logger) ([]string, error) {
+	wanted := selectedInterfaces(ctx, selection, logger)
+
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, fmt.Errorf("listing interfaces: %w", err)
 	}
+
 	var ips []string
+	found := make(map[string]struct{}, len(wanted))
 	for _, iface := range ifaces {
+		if wanted != nil {
+			if _, ok := wanted[iface.Name]; !ok {
+				continue
+			}
+			found[iface.Name] = struct{}{}
+		}
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
 		addrs, err := iface.Addrs()
 		if err != nil {
-			continue
+			// Skipping would return a list the caller cannot tell from a
+			// complete one, and the addresses left out of it look to the caller
+			// like addresses that have gone away, so they get pruned from the
+			// certificate. Report the failure instead of hiding it.
+			return nil, fmt.Errorf("listing addresses of %s: %w", iface.Name, err)
 		}
 		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
+			if ip := addressIP(addr); usableInternalIP(ip) {
+				ips = append(ips, ip.String())
 			}
-			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
-				continue
-			}
-			ips = append(ips, ip.String())
+		}
+	}
+
+	for name := range wanted {
+		if _, ok := found[name]; !ok {
+			logger.Warn("configured interface does not exist", "interface", name)
 		}
 	}
 	return ips, nil
+}
+
+// followsDefaultRoute reports whether a selection asks for the interface that
+// carries the default route, either by naming it or by saying nothing at all.
+func followsDefaultRoute(selection []string) bool {
+	return len(selection) == 0 || (len(selection) == 1 && selection[0] == interfacesDefaultRoute)
+}
+
+// interfaceSelectionText describes an interface selection for logging, naming
+// the default behaviour rather than reporting it as an empty setting.
+func interfaceSelectionText(selection []string) string {
+	if followsDefaultRoute(selection) {
+		return interfacesDefaultRoute
+	}
+	return strings.Join(selection, ",")
 }
 
 // retryBackoffBudget returns the delay getExternalIPWithRetry spends waiting
@@ -1073,7 +1278,15 @@ func updateState(st *certState, hostname string, d addressDiscovery) {
 	}
 }
 
-func certificateIPAddresses(internalIPs []string, externalIP string) []net.IP {
+// certificateIPAddresses returns the IP SANs for a certificate: the loopback
+// address, whatever discovery found, and the addresses configured explicitly.
+// The result is deduplicated and ordered, so two certificates built from the
+// same inputs are byte-identical in this respect and can be compared by eye.
+//
+// Configured addresses are included whether or not this host holds them. That
+// is the point of them: a floating address belongs in the certificates of every
+// node that might take it over, not only the one holding it at issuance.
+func certificateIPAddresses(internalIPs []string, externalIP string, extra []net.IP) []net.IP {
 	candidates := make([]string, 0, 1+len(internalIPs)+1)
 	candidates = append(candidates, "127.0.0.1")
 	candidates = append(candidates, internalIPs...)
@@ -1081,21 +1294,76 @@ func certificateIPAddresses(internalIPs []string, externalIP string) []net.IP {
 		candidates = append(candidates, externalIP)
 	}
 
-	seen := make(map[string]struct{}, len(candidates))
-	ips := make([]net.IP, 0, len(candidates))
-	for _, candidate := range candidates {
-		ip := net.ParseIP(candidate)
+	seen := make(map[string]struct{}, len(candidates)+len(extra))
+	ips := make([]net.IP, 0, len(candidates)+len(extra))
+	add := func(ip net.IP) {
 		if ip == nil {
-			continue
+			return
 		}
 		canonical := ip.String()
 		if _, exists := seen[canonical]; exists {
-			continue
+			return
 		}
 		seen[canonical] = struct{}{}
 		ips = append(ips, ip)
 	}
+	for _, candidate := range candidates {
+		add(net.ParseIP(candidate))
+	}
+	for _, ip := range extra {
+		add(ip)
+	}
+
+	slices.SortFunc(ips, func(a, b net.IP) int { return bytes.Compare(a.To16(), b.To16()) })
 	return ips
+}
+
+// certificateDNSNames returns the DNS SANs for a certificate, deduplicated and
+// ordered for the same reason as the addresses.
+func certificateDNSNames(hostname string, extra []string) []string {
+	names := make([]string, 0, 2+len(extra))
+	seen := make(map[string]struct{}, 2+len(extra))
+	for _, name := range append([]string{hostname, "localhost"}, extra...) {
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// stringSetsEqual reports whether two lists hold the same entries, ignoring
+// order and repetition.
+func stringSetsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		aSet := make(map[string]struct{}, len(a))
+		for _, v := range a {
+			aSet[v] = struct{}{}
+		}
+		bSet := make(map[string]struct{}, len(b))
+		for _, v := range b {
+			bSet[v] = struct{}{}
+		}
+		if len(aSet) != len(bSet) {
+			return false
+		}
+		for v := range aSet {
+			if _, ok := bSet[v]; !ok {
+				return false
+			}
+		}
+		return true
+	}
+	sortedA := slices.Clone(a)
+	sortedB := slices.Clone(b)
+	slices.Sort(sortedA)
+	slices.Sort(sortedB)
+	return slices.Equal(sortedA, sortedB)
 }
 
 // issuanceIPAddresses returns the IP SANs to embed in a certificate that is
@@ -1111,8 +1379,9 @@ func issuanceIPAddresses(
 	certPath string,
 	d addressDiscovery,
 	previousInternalIPs []string,
+	extra []net.IP,
 ) []net.IP {
-	discovered := certificateIPAddresses(d.internalIPs, d.externalIP)
+	discovered := certificateIPAddresses(d.internalIPs, d.externalIP, extra)
 	if d.complete() {
 		return discovered
 	}
@@ -1215,15 +1484,6 @@ func ipAddressesToStrings(ips []net.IP) []string {
 		values[i] = ip.String()
 	}
 	return values
-}
-
-func stringSliceContains(values []string, needle string) bool {
-	for _, v := range values {
-		if v == needle {
-			return true
-		}
-	}
-	return false
 }
 
 func printVersion() {
@@ -1579,6 +1839,14 @@ func parseConfig() *config {
 		"Directory for per-algorithm notification files (env: CERTD_NOTIFY_DIR)")
 	flag.BoolVar(&cfg.internalIP, "internal-ip", envBoolOrDefault("CERTD_INTERNAL_IP", defaultInternalIP),
 		"Include internal IPs in certificate SANs (env: CERTD_INTERNAL_IP)")
+	var extraSANsStr string
+	flag.StringVar(&extraSANsStr, "extra-sans", envOrDefault("CERTD_EXTRA_SANS", ""),
+		"Additional subject alternative names, comma separated: IP addresses or DNS names, "+
+			"always certified whether or not this host holds them (env: CERTD_EXTRA_SANS)")
+	var interfacesStr string
+	flag.StringVar(&interfacesStr, "interfaces", envOrDefault("CERTD_INTERFACES", ""),
+		`Interfaces to take internal IPs from: "`+interfacesDefaultRoute+`" (the default), "`+interfacesAll+
+			`" for every non-loopback interface, or a comma-separated list of names (env: CERTD_INTERFACES)`)
 	flag.BoolVar(&cfg.externalIP, "external-ip", envBoolOrDefault("CERTD_EXTERNAL_IP", defaultExternalIP),
 		"Include external IP in certificate SANs (env: CERTD_EXTERNAL_IP)")
 	flag.IntVar(&cfg.maxRetries, "max-retries", envIntOrDefault("CERTD_MAX_RETRIES", defaultMaxRetries),
@@ -1616,6 +1884,15 @@ func parseConfig() *config {
 		}
 		cfg.pollInterval = d
 	}
+
+	cfg.interfaces = splitList(interfacesStr)
+
+	extraIPs, extraDNS, err := classifyExtraSANs(splitList(extraSANsStr))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid -extra-sans value %q: %v\n", extraSANsStr, err)
+		os.Exit(1)
+	}
+	cfg.extraIPs, cfg.extraDNS = extraIPs, extraDNS
 
 	// Build algorithm list — default to ECDSA if none specified
 	if useRSA {
@@ -1750,6 +2027,18 @@ func parseDuration(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid duration %q", s)
 	}
 	return total, nil
+}
+
+// splitList parses a comma-separated setting, discarding surrounding spaces and
+// empty entries so that "eth0, eth1" and a trailing comma both behave.
+func splitList(value string) []string {
+	var items []string
+	for item := range strings.SplitSeq(value, ",") {
+		if trimmed := strings.TrimSpace(item); trimmed != "" {
+			items = append(items, trimmed)
+		}
+	}
+	return items
 }
 
 func envBoolOrDefault(key string, def bool) bool {
