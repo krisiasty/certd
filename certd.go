@@ -442,14 +442,16 @@ func checkOne(
 		return nil
 	}
 
-	// IP SANs discovered during this cycle. When discovery was incomplete this
-	// set is reconciled at issuance time against the SANs already present in
-	// the existing certificate — see issuanceIPAddresses.
-	discoveredIPs := certificateIPAddresses(d.internalIPs, d.externalIP)
+	// The IP SANs a certificate issued right now would carry. Every branch below
+	// resolves this exactly once, and both the comparison and the issuance use
+	// that one answer, so the two can never disagree about what belongs in the
+	// certificate.
+	resolveIPs := func() []net.IP {
+		return issuanceIPAddresses(logger, paths.cert, d, previousInternalIPs)
+	}
 
-	issueAndNotify := func(reason string) error {
+	issueAndNotify := func(reason string, ipAddresses []net.IP) error {
 		logger.Info("issuing certificate", "reason", reason)
-		ipAddresses := issuanceIPAddresses(logger, paths.cert, d, previousInternalIPs)
 		if err := issueCert(logger, cfg, alg, paths, hostname, ipAddresses); err != nil {
 			return err
 		}
@@ -465,7 +467,7 @@ func checkOne(
 
 	// Case 1: cert or key missing
 	if !fileExists(paths.cert) || !fileExists(paths.key) {
-		return issueAndNotify("missing")
+		return issueAndNotify("missing", resolveIPs())
 	}
 
 	// Parse the existing certificate and verify that its private key matches the
@@ -473,7 +475,7 @@ func checkOne(
 	cert, err := loadCertificateKeyPair(paths, alg)
 	if err != nil {
 		logger.Warn("existing certificate/key pair is invalid, re-issuing", "err", err)
-		return issueAndNotify("invalid certificate/key pair")
+		return issueAndNotify("invalid certificate/key pair", resolveIPs())
 	}
 
 	// Update store with current cert state
@@ -482,23 +484,26 @@ func checkOne(
 	// Case 2: hostname changed (or cert does not include current hostname)
 	if cert.Subject.CommonName != hostname || !stringSliceContains(cert.DNSNames, hostname) {
 		logger.Info("hostname changed", "old", cert.Subject.CommonName, "new", hostname)
-		return issueAndNotify("hostname changed")
+		return issueAndNotify("hostname changed", resolveIPs())
 	}
 
-	// Case 3: IP SANs differ from the addresses currently assigned to the host.
-	// Compare with the certificate itself so changes that happened while certd was
-	// stopped are detected on the first poll after startup. If address discovery
-	// was incomplete, retain the existing certificate until a later poll can make
-	// a complete comparison.
-	if d.complete() {
-		if !ipAddressSetsEqual(cert.IPAddresses, discoveredIPs) {
-			logger.Info(
-				"certificate IP SANs changed",
-				"old", ipAddressesToStrings(cert.IPAddresses),
-				"new", ipAddressesToStrings(discoveredIPs),
-			)
-			return issueAndNotify("IP SANs changed")
-		}
+	// Case 3: IP SANs differ from what this host would be issued now. Comparing
+	// against the resolved issuance set rather than against raw discovery results
+	// means a source that did answer is still acted on when the other did not:
+	// interface enumeration is a local syscall that all but always succeeds,
+	// while external detection needs the internet and routinely fails, and
+	// gating both on one flag left an offline host blind to its own address
+	// changes until a renewal happened to fall due. Addresses this cycle could
+	// not confirm are carried over by issuanceIPAddresses and so compare equal,
+	// which is what keeps an incomplete cycle from reissuing on every poll.
+	issueIPs := resolveIPs()
+	if !ipAddressSetsEqual(cert.IPAddresses, issueIPs) {
+		logger.Info(
+			"certificate IP SANs changed",
+			"old", ipAddressesToStrings(cert.IPAddresses),
+			"new", ipAddressesToStrings(issueIPs),
+		)
+		return issueAndNotify("IP SANs changed", issueIPs)
 	}
 
 	// Case 4: renewal due
@@ -507,7 +512,7 @@ func checkOne(
 			"notAfter", cert.NotAfter,
 			"remaining", time.Until(cert.NotAfter).Round(time.Hour),
 		)
-		return issueAndNotify("renewal due")
+		return issueAndNotify("renewal due", issueIPs)
 	}
 
 	staleNotification := false

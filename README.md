@@ -125,11 +125,11 @@ The certificate is only re-issued if the IP actually changes.
 
 The two address sources are tracked separately, so a failure in one does not discard what the other established.
 Discovery is incomplete when interface enumeration fails, or when no external IP is available and none is known.
-While it is incomplete the SAN comparison is deferred and the existing certificate is kept.
-If a re-issue is needed meanwhile for another reason, such as a hostname change or approaching expiry,
-the IP SANs of the existing certificate that could not be confirmed are carried over, so none is silently dropped.
-An address a working source contradicts is still removed: one that enumeration no longer reports is dropped
-even while external detection is failing.
+The certificate is then compared against the SANs it would be issued with now, rather than against the raw
+discovery results. Addresses this cycle could not confirm are carried over, so none is silently dropped,
+while an address a working source contradicts is still removed.
+An address that enumeration no longer reports is therefore dropped even while external detection is failing,
+and an interface change is still acted on by a host with no internet access at all.
 The set is reconciled on the next poll with complete discovery.
 
 ## Integrating dependent services

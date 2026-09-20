@@ -427,7 +427,7 @@ func TestCheckOneReissuesForIPSANChangesAfterRestart(t *testing.T) {
 	}
 }
 
-func TestCheckOneDefersIPSANComparisonWhenDiscoveryIsIncomplete(t *testing.T) {
+func TestCheckOneKeepsCertificateWhenIncompleteDiscoveryMatchesIt(t *testing.T) {
 	t.Parallel()
 
 	cfg, paths, logger := newTestCertificateConfig(t, false, true)
@@ -459,7 +459,7 @@ func TestCheckOneDefersIPSANComparisonWhenDiscoveryIsIncomplete(t *testing.T) {
 
 	after := loadTestCertificate(t, paths.cert)
 	if before.SerialNumber.Cmp(after.SerialNumber) != 0 {
-		t.Fatal("certificate was reissued using incomplete IP discovery results")
+		t.Fatal("certificate was reissued although it already held every confirmable address")
 	}
 }
 
@@ -578,6 +578,146 @@ func TestCheckOneKeepsDiscoveredAndRetainedIPSANsWhenDiscoveryIsPartial(t *testi
 			ipAddressesToStrings(after.IPAddresses),
 			ipAddressesToStrings(want),
 		)
+	}
+}
+
+func TestCheckOneDetectsInternalIPChangeWhileExternalDetectionFails(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, true, true)
+	const hostname = "host.example.test"
+	if err := issueCert(
+		logger,
+		cfg,
+		algorithmECDSA,
+		paths,
+		hostname,
+		certificateIPAddresses([]string{"192.0.2.10"}, "198.51.100.10"),
+	); err != nil {
+		t.Fatalf("issue initial certificate: %v", err)
+	}
+	before := loadTestCertificate(t, paths.cert)
+
+	// Interface enumeration is authoritative and reports a new address. External
+	// detection is failing, but that must not stop the change being acted on.
+	st := &certState{internalIPs: []string{"192.0.2.10"}}
+	if err := checkOne(
+		logger,
+		cfg,
+		algorithmECDSA,
+		paths,
+		st,
+		newStatusStore([]algorithm{algorithmECDSA}),
+		hostname,
+		addressDiscovery{internalIPs: []string{"192.0.2.20"}, internalComplete: true},
+	); err != nil {
+		t.Fatalf("check certificate: %v", err)
+	}
+
+	after := loadTestCertificate(t, paths.cert)
+	if before.SerialNumber.Cmp(after.SerialNumber) == 0 {
+		t.Fatal("certificate was not reissued after an internal IP change")
+	}
+	want := certificateIPAddresses([]string{"192.0.2.20"}, "198.51.100.10")
+	if !ipAddressSetsEqual(after.IPAddresses, want) {
+		t.Fatalf(
+			"certificate IP SANs = %v, want %v",
+			ipAddressesToStrings(after.IPAddresses),
+			ipAddressesToStrings(want),
+		)
+	}
+}
+
+func TestCheckOneReissuesOnceWhenDiscoveryStaysIncomplete(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, true, true)
+	const hostname = "host.example.test"
+	if err := issueCert(
+		logger,
+		cfg,
+		algorithmECDSA,
+		paths,
+		hostname,
+		certificateIPAddresses([]string{"192.0.2.10"}, "198.51.100.10"),
+	); err != nil {
+		t.Fatalf("issue initial certificate: %v", err)
+	}
+
+	st := &certState{internalIPs: []string{"192.0.2.10"}}
+	store := newStatusStore([]algorithm{algorithmECDSA})
+	d := addressDiscovery{internalIPs: []string{"192.0.2.20"}, internalComplete: true}
+
+	check := func(cycle string) *x509.Certificate {
+		t.Helper()
+		if err := checkOne(logger, cfg, algorithmECDSA, paths, st, store, hostname, d); err != nil {
+			t.Fatalf("%s: %v", cycle, err)
+		}
+		return loadTestCertificate(t, paths.cert)
+	}
+
+	// The set issued under incomplete discovery must be stable, or every
+	// subsequent poll reissues the certificate and restarts dependent services.
+	first := check("first cycle")
+	second := check("second cycle")
+	if first.SerialNumber.Cmp(second.SerialNumber) != 0 {
+		t.Fatalf(
+			"certificate reissued again on an unchanged cycle: %v then %v",
+			ipAddressesToStrings(first.IPAddresses),
+			ipAddressesToStrings(second.IPAddresses),
+		)
+	}
+}
+
+func TestCheckOneRemainsStableWhenInterfaceEnumerationFails(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, true, true)
+	const hostname = "host.example.test"
+	if err := issueCert(
+		logger,
+		cfg,
+		algorithmECDSA,
+		paths,
+		hostname,
+		certificateIPAddresses([]string{"192.0.2.10"}, "198.51.100.10"),
+	); err != nil {
+		t.Fatalf("issue initial certificate: %v", err)
+	}
+
+	// Interface enumeration failed, so no internal address can be confirmed or
+	// contradicted, but the external address is known and has changed.
+	st := &certState{internalIPs: []string{"192.0.2.10"}}
+	store := newStatusStore([]algorithm{algorithmECDSA})
+	d := addressDiscovery{externalIP: "198.51.100.20", externalComplete: true}
+
+	check := func(cycle string) *x509.Certificate {
+		t.Helper()
+		if err := checkOne(logger, cfg, algorithmECDSA, paths, st, store, hostname, d); err != nil {
+			t.Fatalf("%s: %v", cycle, err)
+		}
+		return loadTestCertificate(t, paths.cert)
+	}
+
+	first := check("first cycle")
+	// The internal addresses could not be confirmed, so they are kept, and the
+	// previous external address cannot be told apart from them. Both externals
+	// are therefore present until enumeration recovers.
+	want := certificateIPAddresses(
+		[]string{"192.0.2.10", "198.51.100.10"},
+		"198.51.100.20",
+	)
+	if !ipAddressSetsEqual(first.IPAddresses, want) {
+		t.Fatalf(
+			"certificate IP SANs = %v, want %v",
+			ipAddressesToStrings(first.IPAddresses),
+			ipAddressesToStrings(want),
+		)
+	}
+
+	second := check("second cycle")
+	if first.SerialNumber.Cmp(second.SerialNumber) != 0 {
+		t.Fatal("certificate reissued again on an unchanged cycle")
 	}
 }
 
