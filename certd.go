@@ -459,6 +459,13 @@ func checkAll(
 		lastKnown := states[cfg.algorithms[0]].externalIP
 		externalIP, err := getExternalIPWithRetry(ctx, cfg.maxRetries, logger)
 		if err != nil {
+			// Detection waits between attempts, so a shutdown most often lands
+			// here. It is not a failed lookup, and reporting it as one would
+			// bury the reason the cycle stopped.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				logger.Info("shutting down during external IP detection")
+				return false, ctxErr
+			}
 			logger.Warn("could not determine external IP, using last known value",
 				"lastKnown", lastKnown,
 				"err", err,
@@ -474,11 +481,20 @@ func checkAll(
 	// Process each algorithm independently — errors are logged but don't stop others.
 	allSuccessful := true
 	for _, alg := range cfg.algorithms {
+		// Certificates are issued one algorithm at a time, and each ends by
+		// touching a notification file that restarts every dependent service.
+		// Once shutdown has begun, leave the rest to the next start.
+		if err := ctx.Err(); err != nil {
+			logger.Info("shutting down, leaving the remaining certificates for the next start")
+			return false, err
+		}
+
 		paths := certPathsForAlgorithm(cfg, alg)
 		st := states[alg]
 		algLogger := logger.With("algorithm", alg)
 
 		if err := checkOne(
+			ctx,
 			algLogger,
 			cfg,
 			alg,
@@ -488,6 +504,9 @@ func checkAll(
 			hostname,
 			discovery,
 		); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return false, ctxErr
+			}
 			allSuccessful = false
 			store.recordError(alg, err)
 			algLogger.Error("failed to process certificate, will retry next poll", "err", err)
@@ -521,6 +540,7 @@ func notifySystemdReady() error {
 
 // checkOne performs a single check-and-issue cycle for one algorithm.
 func checkOne(
+	ctx context.Context,
 	logger *slog.Logger,
 	cfg *config,
 	alg algorithm,
@@ -530,6 +550,13 @@ func checkOne(
 	hostname string,
 	d addressDiscovery,
 ) error {
+	// Nothing here is worth starting during shutdown. Issuing writes a new key
+	// pair and then notifies, which restarts every service that depends on it;
+	// the next start will reach the same conclusion and do it at a better time.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	// Captured before any issuance overwrites it: the internal addresses this
 	// process last observed, used to tell a departed address from an
 	// unconfirmed one when discovery is incomplete.

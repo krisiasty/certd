@@ -232,6 +232,10 @@ certificates whose contents are entirely determined by configuration, with no de
 This keeps `certd` decoupled from the services that consume its certificates — it only writes a file,
 and systemd handles the rest.
 
+Because touching that file restarts every service that depends on the certificate, `certd` stops issuing and
+notifying as soon as it is asked to shut down, and leaves any remaining work to the next start. A `SIGTERM`
+arriving mid-cycle therefore never restarts dependent services on the way out, and `certd` still exits zero.
+
 ### Notification files
 
 After issuing or renewing a certificate, `certd` touches a file in `CERTD_NOTIFY_DIR`:

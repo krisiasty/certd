@@ -329,6 +329,7 @@ func TestCheckOneReissuesMismatchedCertificateKeyPair(t *testing.T) {
 	}
 
 	if err := checkOne(
+		t.Context(),
 		logger,
 		cfg,
 		algorithmECDSA,
@@ -360,6 +361,7 @@ func TestCheckOneReissuesCertificateWithWrongAlgorithm(t *testing.T) {
 	}
 
 	if err := checkOne(
+		t.Context(),
 		logger,
 		cfg,
 		algorithmECDSA,
@@ -432,6 +434,7 @@ func TestCheckOneRetriesFailedNotification(t *testing.T) {
 	const hostname = "host.example.test"
 
 	if err := checkOne(
+		t.Context(),
 		logger,
 		cfg,
 		algorithmECDSA,
@@ -452,6 +455,7 @@ func TestCheckOneRetriesFailedNotification(t *testing.T) {
 		t.Fatalf("remove notification blocker: %v", err)
 	}
 	if err := checkOne(
+		t.Context(),
 		logger,
 		cfg,
 		algorithmECDSA,
@@ -475,6 +479,84 @@ func TestCheckOneRetriesFailedNotification(t *testing.T) {
 	}
 }
 
+func TestRunExitsCleanlyWhenShutDownBeforeTheFirstCheck(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	cfg.algorithms = []algorithm{algorithmECDSA}
+	cfg.pollInterval = time.Hour
+	cfg.maxRetries = defaultMaxRetries
+	cfg.httpAddr = ""
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// main treats context.Canceled as a clean exit, so this is the difference
+	// between exit 0 and a unit reported as failed.
+	if err := run(ctx, cfg, logger); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run during shutdown = %v, want context.Canceled", err)
+	}
+	if fileExists(paths.cert) || fileExists(paths.key) {
+		t.Fatal("a certificate was issued while shutting down")
+	}
+	if fileExists(paths.notify) {
+		t.Fatal("dependent services were notified while shutting down")
+	}
+}
+
+func TestCheckAllStopsIssuingWhenShuttingDown(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	cfg.algorithms = []algorithm{algorithmECDSA}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	states := map[algorithm]*certState{algorithmECDSA: {}}
+	if _, err := checkAll(ctx, cfg, logger, states, newStatusStore(cfg.algorithms)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("checkAll during shutdown = %v, want context.Canceled", err)
+	}
+	if fileExists(paths.cert) || fileExists(paths.key) {
+		t.Fatal("a certificate was issued while shutting down")
+	}
+	// Touching the notification file restarts every dependent service, which
+	// is the last thing that should happen on the way out.
+	if fileExists(paths.notify) {
+		t.Fatal("dependent services were notified while shutting down")
+	}
+}
+
+func TestCheckOneDoesNotIssueWhenShuttingDown(t *testing.T) {
+	t.Parallel()
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := checkOne(
+		ctx,
+		logger,
+		cfg,
+		algorithmECDSA,
+		paths,
+		&certState{},
+		newStatusStore([]algorithm{algorithmECDSA}),
+		"host.example.test",
+		completeDiscovery(nil, ""),
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("checkOne during shutdown = %v, want context.Canceled", err)
+	}
+	if fileExists(paths.cert) || fileExists(paths.key) {
+		t.Fatal("a certificate was issued while shutting down")
+	}
+	if fileExists(paths.notify) {
+		t.Fatal("dependent services were notified while shutting down")
+	}
+}
+
 func TestCheckOneRecoversMissedNotificationAfterRestart(t *testing.T) {
 	t.Parallel()
 
@@ -486,6 +568,7 @@ func TestCheckOneRecoversMissedNotificationAfterRestart(t *testing.T) {
 	issued := loadTestCertificate(t, paths.cert)
 
 	if err := checkOne(
+		t.Context(),
 		logger,
 		cfg,
 		algorithmECDSA,
@@ -559,6 +642,7 @@ func TestCheckOneReissuesForIPSANChangesAfterRestart(t *testing.T) {
 			stateAfterRestart := &certState{}
 			store := newStatusStore([]algorithm{algorithmECDSA})
 			if err := checkOne(
+				t.Context(),
 				logger,
 				cfg,
 				algorithmECDSA,
@@ -605,6 +689,7 @@ func TestCheckOneKeepsCertificateWhenIncompleteDiscoveryMatchesIt(t *testing.T) 
 
 	before := loadTestCertificate(t, paths.cert)
 	if err := checkOne(
+		t.Context(),
 		logger,
 		cfg,
 		algorithmECDSA,
@@ -676,6 +761,7 @@ func TestCheckOneRetainsIPSANsWhenReissuingWithIncompleteDiscovery(t *testing.T)
 			before := loadTestCertificate(t, paths.cert)
 			cfg.lifetime = tt.checkLifetime
 			if err := checkOne(
+				t.Context(),
 				logger,
 				cfg,
 				algorithmECDSA,
@@ -724,6 +810,7 @@ func TestCheckOneKeepsDiscoveredAndRetainedIPSANsWhenDiscoveryIsPartial(t *testi
 	// External IP discovery failed this cycle, but a new internal address was
 	// found. The reissued certificate must carry both.
 	if err := checkOne(
+		t.Context(),
 		logger,
 		cfg,
 		algorithmECDSA,
@@ -772,6 +859,7 @@ func TestCheckOneDetectsInternalIPChangeWhileExternalDetectionFails(t *testing.T
 	// detection is failing, but that must not stop the change being acted on.
 	st := &certState{internalIPs: []string{"192.0.2.10"}}
 	if err := checkOne(
+		t.Context(),
 		logger,
 		cfg,
 		algorithmECDSA,
@@ -820,7 +908,7 @@ func TestCheckOneReissuesOnceWhenDiscoveryStaysIncomplete(t *testing.T) {
 
 	check := func(cycle string) *x509.Certificate {
 		t.Helper()
-		if err := checkOne(logger, cfg, algorithmECDSA, paths, st, store, hostname, d); err != nil {
+		if err := checkOne(t.Context(), logger, cfg, algorithmECDSA, paths, st, store, hostname, d); err != nil {
 			t.Fatalf("%s: %v", cycle, err)
 		}
 		return loadTestCertificate(t, paths.cert)
@@ -863,7 +951,7 @@ func TestCheckOneRemainsStableWhenInterfaceEnumerationFails(t *testing.T) {
 
 	check := func(cycle string) *x509.Certificate {
 		t.Helper()
-		if err := checkOne(logger, cfg, algorithmECDSA, paths, st, store, hostname, d); err != nil {
+		if err := checkOne(t.Context(), logger, cfg, algorithmECDSA, paths, st, store, hostname, d); err != nil {
 			t.Fatalf("%s: %v", cycle, err)
 		}
 		return loadTestCertificate(t, paths.cert)
@@ -913,6 +1001,7 @@ func TestCheckOnePrunesDepartedInternalIPWhileExternalDetectionFails(t *testing.
 	// external SAN cannot be reconfirmed and must be kept.
 	st := &certState{internalIPs: []string{"192.0.2.10"}}
 	if err := checkOne(
+		t.Context(),
 		logger,
 		cfg,
 		algorithmECDSA,
@@ -941,6 +1030,7 @@ func TestCheckOneIssuesMissingCertificateDespiteIncompleteDiscovery(t *testing.T
 
 	cfg, paths, logger := newTestCertificateConfig(t, true, true)
 	if err := checkOne(
+		t.Context(),
 		logger,
 		cfg,
 		algorithmECDSA,
@@ -997,6 +1087,7 @@ func TestCheckOneReissuesWhenConfiguredLifetimeChanges(t *testing.T) {
 
 			cfg.lifetime = tt.modified
 			if err := checkOne(
+				t.Context(),
 				logger,
 				cfg,
 				algorithmECDSA,
@@ -1043,6 +1134,7 @@ func TestCheckOneReissuesOnceAfterLifetimeChange(t *testing.T) {
 	check := func(cycle string) *x509.Certificate {
 		t.Helper()
 		if err := checkOne(
+			t.Context(),
 			logger, cfg, algorithmECDSA, paths, st, store, hostname, completeDiscovery(nil, ""),
 		); err != nil {
 			t.Fatalf("%s: %v", cycle, err)
@@ -1346,6 +1438,7 @@ func TestCheckOneCertifiesConfiguredExtraSANs(t *testing.T) {
 	cfg.extraDNS = []string{"vip.example.test"}
 
 	if err := checkOne(
+		t.Context(),
 		logger,
 		cfg,
 		algorithmECDSA,
@@ -1381,6 +1474,7 @@ func TestCheckOneReissuesWhenExtraSANsChange(t *testing.T) {
 	check := func(stage string) *x509.Certificate {
 		t.Helper()
 		if err := checkOne(
+			t.Context(),
 			logger, cfg, algorithmECDSA, paths, st, store, hostname, completeDiscovery(nil, ""),
 		); err != nil {
 			t.Fatalf("%s: %v", stage, err)
