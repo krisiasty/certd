@@ -992,6 +992,74 @@ func TestNeedsRenewal(t *testing.T) {
 	}
 }
 
+func TestParseDuration(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		want  time.Duration
+	}{
+		{name: "years", input: "1y", want: 8760 * time.Hour},
+		{name: "weeks", input: "2w", want: 336 * time.Hour},
+		{name: "days", input: "90d", want: 2160 * time.Hour},
+		{name: "combined", input: "1y30d", want: 9480 * time.Hour},
+		{name: "three units", input: "2w3d12h", want: 420 * time.Hour},
+		{name: "standard unit only", input: "90m", want: 90 * time.Minute},
+		{name: "extended and standard", input: "1d12h", want: 36 * time.Hour},
+		{name: "zero", input: "0", want: 0},
+		{name: "largest representable", input: "292y", want: 292 * 8760 * time.Hour},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseDuration(tt.input)
+			if err != nil {
+				t.Fatalf("parseDuration(%q) = %v, want %s", tt.input, err, tt.want)
+			}
+			if got != tt.want {
+				t.Fatalf("parseDuration(%q) = %s, want %s", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseDurationRejectsInvalidInput(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "empty", input: ""},
+		{name: "not a duration", input: "soon"},
+		{name: "unknown unit", input: "5f"},
+		// Each of these silently produced a wrong duration rather than an
+		// error: the count overflowed its multiplication, or the digits did
+		// not fit in an int at all.
+		{name: "count overflows the unit", input: "2000000y"},
+		{name: "count exceeds int64", input: "1h99999999999999999999d"},
+		{name: "beyond the largest duration", input: "293y"},
+		{name: "sum overflows", input: "292y292y"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parseDuration(tt.input)
+			if err == nil {
+				t.Fatalf("parseDuration(%q) = %s, want an error", tt.input, got)
+			}
+			if got != 0 {
+				t.Fatalf("parseDuration(%q) returned %s alongside its error, want 0", tt.input, got)
+			}
+		})
+	}
+}
+
 func TestREADMEDocumentsActualDefaults(t *testing.T) {
 	t.Parallel()
 

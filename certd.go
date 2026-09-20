@@ -1585,35 +1585,72 @@ func envDurationOrDefault(key string, def time.Duration, logger *slog.Logger) ti
 // extendedDurationRe matches a number followed by y, w, or d.
 var extendedDurationRe = regexp.MustCompile(`(\d+)(y|w|d)`)
 
+// maxDuration is the largest value a time.Duration can represent, a little over
+// 292 years. Any input implying more than this is rejected rather than wrapped.
+const maxDuration = time.Duration(1<<63 - 1)
+
 // parseDuration extends Go's time.ParseDuration with support for:
 //
 //	y = 365 * 24h
 //	w = 7 * 24h
 //	d = 24h
 //
-// Units can be combined: "1y30d", "2w3d12h", "90d".
+// Units can be combined: "1y30d", "2w3d12h", "90d". Counts are checked against
+// what a time.Duration can hold, so an input larger than roughly 292 years is
+// an error rather than a wrapped, and possibly negative, value.
 func parseDuration(s string) (time.Duration, error) {
+	tooLong := func() error {
+		return fmt.Errorf("invalid duration %q: longer than the maximum of about 292 years", s)
+	}
+
 	var total time.Duration
-	remainder := extendedDurationRe.ReplaceAllStringFunc(s, func(match string) string {
-		m := extendedDurationRe.FindStringSubmatch(match)
-		n, _ := strconv.Atoi(m[1])
-		switch m[2] {
-		case "y":
-			total += time.Duration(n) * 8760 * time.Hour
-		case "w":
-			total += time.Duration(n) * 168 * time.Hour
-		case "d":
-			total += time.Duration(n) * 24 * time.Hour
+	var remainder strings.Builder
+	consumed := 0
+
+	for _, match := range extendedDurationRe.FindAllStringSubmatchIndex(s, -1) {
+		remainder.WriteString(s[consumed:match[0]])
+		consumed = match[1]
+
+		digits := s[match[2]:match[3]]
+		count, err := strconv.ParseInt(digits, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid duration %q: %s is out of range", s, digits)
 		}
-		return ""
-	})
-	if remainder != "" {
-		d, err := time.ParseDuration(remainder)
+
+		var unit time.Duration
+		switch s[match[4]:match[5]] {
+		case "y":
+			unit = 8760 * time.Hour
+		case "w":
+			unit = 168 * time.Hour
+		case "d":
+			unit = 24 * time.Hour
+		}
+
+		if count > int64(maxDuration/unit) {
+			return 0, tooLong()
+		}
+		scaled := time.Duration(count) * unit
+		if total > maxDuration-scaled {
+			return 0, tooLong()
+		}
+		total += scaled
+	}
+	remainder.WriteString(s[consumed:])
+
+	if rest := remainder.String(); rest != "" {
+		d, err := time.ParseDuration(rest)
 		if err != nil {
 			return 0, fmt.Errorf("invalid duration %q: %w", s, err)
 		}
+		// Only a positive remainder can overflow: total is never negative, so
+		// adding a negative one cannot fall below the minimum.
+		if d > 0 && total > maxDuration-d {
+			return 0, tooLong()
+		}
 		total += d
 	}
+
 	if total == 0 && s != "0" {
 		return 0, fmt.Errorf("invalid duration %q", s)
 	}

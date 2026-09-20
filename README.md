@@ -84,6 +84,8 @@ default installation runs with the unit's values rather than these; see [files/e
 
 `CERTD_LIFETIME` must be at least `1h` and `CERTD_POLL_INTERVAL` at least `1m`. Re-issuing restarts every
 dependent service, so rotating faster than that costs more than the shorter lifetime is worth.
+At the other end, a duration cannot exceed about 292 years, the largest a Go `time.Duration` can hold; anything
+longer is rejected rather than wrapped around into a short or negative value.
 
 The two must also agree with each other. Renewal begins once less than one third of the lifetime remains, and
 `certd` only notices at a poll, so a poll has to fall inside that window: `CERTD_POLL_INTERVAL` must be shorter
