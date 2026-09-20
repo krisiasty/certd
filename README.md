@@ -88,7 +88,7 @@ Each setting is bounded at both ends, and a value outside its range is rejected 
 |-----------------------|---------------|
 | `CERTD_LIFETIME`      | `1h` to `25y` |
 | `CERTD_POLL_INTERVAL` | `1m` to `1d`  |
-| `CERTD_MAX_RETRIES`   | `1` to `10`   |
+| `CERTD_MAX_RETRIES`   | `1` to `20`   |
 
 Re-issuing restarts every dependent service, so rotating faster than an hour costs more than the shorter
 lifetime is worth. At the other end `certd` issues self-signed certificates with no revocation path, so the
@@ -98,10 +98,19 @@ which is the very thing `certd` runs to catch.
 
 `CERTD_MAX_RETRIES` is bounded because every retry delays the poll it belongs to. The delay between external IP
 attempts doubles from one second and then holds at sixteen, and nothing is waited after the final attempt, so
-the default of five retries waits 15 seconds in total and the maximum of ten waits 1 minute 35 seconds. Without
-that ceiling each retry would cost as much as all the ones before it together: ten retries would wait about
-seventeen minutes and twenty would wait twelve days, holding back the systemd readiness notification just as
-long, since it is only sent once the first check completes.
+the default of five retries waits 15 seconds in total and the maximum of twenty waits 4 minutes 15 seconds.
+Without that ceiling each retry would cost as much as all the ones before it together, and twenty retries would
+wait twelve days — holding back the systemd readiness notification just as long, since it is only sent once the
+first check completes.
+
+Retries are also held against the poll interval: `certd` refuses to start when they would wait longer than a
+single poll, because the next poll would have made the same attempt sooner. That only binds on short intervals.
+A one-minute poll affords seven retries; five minutes or more affords the full twenty. Both retry checks are
+skipped when `CERTD_EXTERNAL_IP` is off, since nothing is retried then.
+
+The budget counts only the waiting. A provider that refuses a connection fails immediately, while one that drops
+the packets costs up to a further five seconds each, which is why a failing check can take longer than the
+figures above.
 
 The two must also agree with each other. Renewal begins once less than one third of the lifetime remains, and
 `certd` only notices at a poll, so a poll has to fall inside that window: `CERTD_POLL_INTERVAL` must be shorter

@@ -123,6 +123,58 @@ func TestRunRejectsInvalidConfigBeforeSideEffects(t *testing.T) {
 	}
 }
 
+func TestValidateConfigBoundsRetriesByPollInterval(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		externalIP bool
+		retries    int
+		poll       time.Duration
+		wantError  string
+	}{
+		{name: "default retries at the shortest poll", externalIP: true, retries: defaultMaxRetries, poll: time.Minute},
+		{name: "most retries a one minute poll affords", externalIP: true, retries: 7, poll: time.Minute},
+		{name: "most retries at all, with room for them", externalIP: true, retries: maxRetries, poll: 5 * time.Minute},
+		{
+			name: "retries outlast the poll interval", externalIP: true, retries: maxRetries, poll: time.Minute,
+			wantError: "longer than the",
+		},
+		{
+			name: "more retries than permitted", externalIP: true, retries: maxRetries + 1, poll: time.Hour,
+			wantError: "maximum retries must be between",
+		},
+		// With external IP detection off nothing retries and nothing waits, so
+		// the setting is inert and is not held against the poll interval.
+		{name: "unused retries are not checked", externalIP: false, retries: maxRetries, poll: time.Minute},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := &config{
+				algorithms:   []algorithm{algorithmECDSA},
+				lifetime:     defaultLifetime,
+				pollInterval: tt.poll,
+				externalIP:   tt.externalIP,
+				maxRetries:   tt.retries,
+			}
+			err := validateConfig(cfg)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("validateConfig(%d retries, %s poll) = %v, want nil", tt.retries, tt.poll, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("validateConfig(%d retries, %s poll) = %v, want error containing %q",
+					tt.retries, tt.poll, err, tt.wantError)
+			}
+		})
+	}
+}
+
 func TestValidateConfigAcceptsConfigurationsThatCanRenewInTime(t *testing.T) {
 	t.Parallel()
 
@@ -1095,16 +1147,8 @@ func TestRetryBackoffStaysBoundedAtMaxRetries(t *testing.T) {
 	// exponential time: at the permitted maximum the last sleep alone would run
 	// for days, and because the first check gates the systemd readiness
 	// notification, it would hold up startup for just as long.
-	//
-	// n attempts wait n-1 times, since nothing is waited after the last one.
-	var total time.Duration
-	backoff := time.Second
-	for range maxRetries - 1 {
-		total += backoff
-		backoff = nextBackoff(backoff)
-	}
-
-	if limit := 2 * time.Minute; total > limit {
+	total := retryBackoffBudget(maxRetries)
+	if limit := 5 * time.Minute; total > limit {
 		t.Fatalf("worst-case backoff over %d retries = %s, want at most %s", maxRetries, total, limit)
 	}
 }

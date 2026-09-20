@@ -194,14 +194,16 @@ const (
 	// path, so the lifetime is the whole compromise window; 25y is already far
 	// beyond the life of the host it identifies. A poll interval above a day
 	// stops certd doing the job it exists for, since a hostname or address
-	// change goes unnoticed for that long. And the external IP backoff doubles
-	// from a second and sleeps after every attempt, so the retry count buys
-	// 2^n seconds of delay in a single cycle: ten costs about twenty minutes,
-	// twenty would cost twelve days and block startup readiness for the same.
+	// change goes unnoticed for that long. Each retry costs a flat 16s once the
+	// backoff reaches its cap, so twenty attempts spend about four minutes
+	// before giving up and leaving it to the next poll, which retries anyway
+	// against a last known value kept in the meantime. Retries are separately
+	// held against the poll interval, so this ceiling only binds where the
+	// interval is long enough to afford it.
 	maxLifetime     = 25 * 8760 * time.Hour
 	maxPollInterval = 24 * time.Hour
 	minRetries      = 1
-	maxRetries      = 10
+	maxRetries      = 20
 
 	// maxBackoff caps the delay between external IP attempts. Doubling without
 	// a ceiling makes each extra retry cost as much as every one before it put
@@ -376,11 +378,26 @@ func validateConfig(cfg *config) error {
 			time.Duration(float64(cfg.pollInterval)/renewThreshold).Round(time.Second),
 		)
 	}
-	if cfg.externalIP && (cfg.maxRetries < minRetries || cfg.maxRetries > maxRetries) {
-		return fmt.Errorf(
-			"maximum retries must be between %d and %d when external IP detection is enabled, got %d",
-			minRetries, maxRetries, cfg.maxRetries,
-		)
+	// Both retry bounds are conditional because cfg.maxRetries has exactly one
+	// consumer, getExternalIPWithRetry, and that is only reached when external
+	// IP detection is enabled. With it off nothing retries and nothing waits,
+	// so the setting is inert rather than wrong.
+	if cfg.externalIP {
+		if cfg.maxRetries < minRetries || cfg.maxRetries > maxRetries {
+			return fmt.Errorf(
+				"maximum retries must be between %d and %d when external IP detection is enabled, got %d",
+				minRetries, maxRetries, cfg.maxRetries,
+			)
+		}
+		// Retrying for longer than the poll interval is pointless work: the
+		// next poll would have made the same attempt sooner.
+		if budget := retryBackoffBudget(cfg.maxRetries); budget > cfg.pollInterval {
+			return fmt.Errorf(
+				"%d retries wait up to %s between external IP attempts, longer than the %s poll interval; "+
+					"use fewer retries, or a longer poll interval",
+				cfg.maxRetries, humanDuration(budget), humanDuration(cfg.pollInterval),
+			)
+		}
 	}
 	return nil
 }
@@ -761,6 +778,24 @@ func getInternalIPs() ([]string, error) {
 		}
 	}
 	return ips, nil
+}
+
+// retryBackoffBudget returns the delay getExternalIPWithRetry spends waiting
+// across the given number of attempts, which wait one fewer time than they
+// attempt since nothing is waited after the last one.
+//
+// It counts only the waiting, not the attempts themselves: a provider that
+// refuses a connection fails at once, while one that black-holes it costs a
+// further timeout per provider. That cost is contingent on how the network
+// fails, whereas the backoff is paid every time.
+func retryBackoffBudget(attempts int) time.Duration {
+	var total time.Duration
+	backoff := time.Second
+	for range attempts - 1 {
+		total += backoff
+		backoff = nextBackoff(backoff)
+	}
+	return total
 }
 
 // nextBackoff returns the delay to wait after a failed attempt, doubling up to
