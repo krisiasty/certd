@@ -185,6 +185,11 @@ When `CERTD_EXTERNAL_IP=true`, `certd` queries several external IP providers in 
 2. `https://checkip.amazonaws.com`
 3. `https://ifconfig.io/ip`
 
+A provider counts as having answered only when it returns `200` with a body that parses as an IPv4 address.
+Anything else — a connection failure, a `429` or `503`, or a body that is not an address — is logged and the
+next provider is tried. The body of an unsuccessful response is never read as an answer: a proxy or captive
+portal replying with something address-shaped is describing itself rather than this host.
+
 If all providers fail, `certd` falls back to the last known external IP and logs a warning.
 The certificate is only re-issued if the IP actually changes.
 

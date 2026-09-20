@@ -8,8 +8,11 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1102,6 +1105,81 @@ func withFailingExternalIPProviders(t *testing.T) {
 	restore := externalIPProviders
 	t.Cleanup(func() { externalIPProviders = restore })
 	externalIPProviders = []string{"://invalid"}
+}
+
+// externalIPProvider starts a stand-in provider returning the given status and
+// body, and returns its URL.
+func externalIPProvider(t *testing.T, status int, body string) string {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
+func useExternalIPProviders(t *testing.T, urls ...string) {
+	t.Helper()
+
+	restore := externalIPProviders
+	t.Cleanup(func() { externalIPProviders = restore })
+	externalIPProviders = urls
+}
+
+func TestGetExternalIPIgnoresUnsuccessfulResponses(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		// The body of an error response is not an answer, however much it may
+		// look like one. A proxy or captive portal answering 429 or 503 with
+		// something address-shaped is reporting its own state, not this host's.
+		{name: "rate limited", status: http.StatusTooManyRequests, body: "203.0.113.5"},
+		{name: "server error", status: http.StatusInternalServerError, body: "203.0.113.5"},
+		{name: "not found", status: http.StatusNotFound, body: "203.0.113.5"},
+		{name: "redirect body", status: http.StatusBadGateway, body: "203.0.113.5"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			useExternalIPProviders(t, externalIPProvider(t, tt.status, tt.body))
+
+			ip, err := getExternalIP(t.Context(), slog.New(slog.DiscardHandler))
+			if err == nil {
+				t.Fatalf("getExternalIP accepted %s %q and returned %q", tt.name, tt.body, ip)
+			}
+		})
+	}
+}
+
+func TestGetExternalIPFallsThroughToASuccessfulProvider(t *testing.T) {
+	useExternalIPProviders(t,
+		externalIPProvider(t, http.StatusTooManyRequests, "203.0.113.5"),
+		externalIPProvider(t, http.StatusOK, "198.51.100.20\n"),
+	)
+
+	ip, err := getExternalIP(t.Context(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("getExternalIP: %v", err)
+	}
+	if ip != "198.51.100.20" {
+		t.Fatalf("getExternalIP = %q, want the address from the provider that answered 200", ip)
+	}
+}
+
+func TestGetExternalIPAcceptsASuccessfulResponse(t *testing.T) {
+	useExternalIPProviders(t, externalIPProvider(t, http.StatusOK, "  203.0.113.5  "))
+
+	ip, err := getExternalIP(t.Context(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("getExternalIP: %v", err)
+	}
+	if ip != "203.0.113.5" {
+		t.Fatalf("getExternalIP = %q, want 203.0.113.5", ip)
+	}
 }
 
 func TestGetExternalIPWithRetryDoesNotWaitAfterTheFinalAttempt(t *testing.T) {
