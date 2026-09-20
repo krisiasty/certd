@@ -1804,6 +1804,99 @@ func TestParseDurationRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestEnvBool(t *testing.T) {
+	accepted := map[string]bool{
+		"true": true, "false": false,
+		"TRUE": true, "FALSE": false,
+		"True": true, "False": false,
+		" true ": true, " false ": false,
+	}
+	for value, want := range accepted {
+		t.Run("accepts "+value, func(t *testing.T) {
+			t.Setenv("CERTD_TEST_BOOL", value)
+			got, err := envBool("CERTD_TEST_BOOL", !want)
+			if err != nil {
+				t.Fatalf("envBool(%q) = %v, want %t", value, err, want)
+			}
+			if got != want {
+				t.Fatalf("envBool(%q) = %t, want %t", value, got, want)
+			}
+		})
+	}
+
+	// Anything else is a mistake. Reading it as false would quietly switch off
+	// a certificate or an address source, which is exactly what this used to do
+	// with "yes" and "on".
+	for _, value := range []string{"yes", "no", "on", "off", "1", "0", "y", "n", "TRUEISH", "2", "-"} {
+		t.Run("rejects "+value, func(t *testing.T) {
+			t.Setenv("CERTD_TEST_BOOL", value)
+			if got, err := envBool("CERTD_TEST_BOOL", false); err == nil {
+				t.Fatalf("envBool(%q) = %t, want an error", value, got)
+			}
+		})
+	}
+
+	t.Run("unset uses the default", func(t *testing.T) {
+		t.Setenv("CERTD_TEST_BOOL", "")
+		for _, def := range []bool{true, false} {
+			got, err := envBool("CERTD_TEST_BOOL", def)
+			if err != nil || got != def {
+				t.Fatalf("envBool(unset) = %t, %v, want %t, nil", got, err, def)
+			}
+		}
+	})
+}
+
+func TestEnvInt(t *testing.T) {
+	t.Run("whole numbers", func(t *testing.T) {
+		for value, want := range map[string]int{"5": 5, "0": 0, "-3": -3, " 7 ": 7, "+2": 2} {
+			t.Setenv("CERTD_TEST_INT", value)
+			got, err := envInt("CERTD_TEST_INT", 99)
+			if err != nil || got != want {
+				t.Fatalf("envInt(%q) = %d, %v, want %d, nil", value, got, err, want)
+			}
+		}
+	})
+
+	// Sscanf stopped at the first character it could not read, so each of these
+	// silently became a number the operator never wrote.
+	t.Run("trailing rubbish", func(t *testing.T) {
+		for _, value := range []string{"3.9", "5x", "1O", "10 20", "", "five", "0x10"} {
+			t.Setenv("CERTD_TEST_INT", value)
+			got, err := envInt("CERTD_TEST_INT", 99)
+			if value == "" {
+				if err != nil || got != 99 {
+					t.Fatalf("envInt(unset) = %d, %v, want the default", got, err)
+				}
+				continue
+			}
+			if err == nil {
+				t.Fatalf("envInt(%q) = %d, want an error", value, got)
+			}
+		}
+	})
+}
+
+func TestEnvDuration(t *testing.T) {
+	t.Setenv("CERTD_TEST_DURATION", "1y")
+	got, err := envDuration("CERTD_TEST_DURATION", time.Hour)
+	if err != nil || got != 8760*time.Hour {
+		t.Fatalf("envDuration(\"1y\") = %s, %v, want 8760h", got, err)
+	}
+
+	for _, value := range []string{"1yy", "soon", "2000000y", "1h99999999999999999999d"} {
+		t.Setenv("CERTD_TEST_DURATION", value)
+		if got, err := envDuration("CERTD_TEST_DURATION", time.Hour); err == nil {
+			t.Fatalf("envDuration(%q) = %s, want an error", value, got)
+		}
+	}
+
+	t.Setenv("CERTD_TEST_DURATION", "")
+	if got, err := envDuration("CERTD_TEST_DURATION", time.Hour); err != nil || got != time.Hour {
+		t.Fatalf("envDuration(unset) = %s, %v, want the default", got, err)
+	}
+}
+
 func TestPackagedUnitGivesUpAfterRepeatedFailures(t *testing.T) {
 	t.Parallel()
 

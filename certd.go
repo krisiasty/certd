@@ -1919,23 +1919,46 @@ func (ew *errWriter) printf(format string, args ...any) {
 
 // parseConfig reads CLI flags and env vars; CLI flags take precedence over env vars.
 func parseConfig() *config {
-	// Need a bootstrap logger for duration parse warnings before the main logger is set up
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	// Every unusable value is collected rather than reported one at a time, so a
+	// configuration with several mistakes takes one pass to fix instead of one
+	// restart per mistake.
+	var envErrs []error
+	envBoolOr := func(key string, def bool) bool {
+		v, err := envBool(key, def)
+		if err != nil {
+			envErrs = append(envErrs, err)
+		}
+		return v
+	}
+	envIntOr := func(key string, def int) int {
+		v, err := envInt(key, def)
+		if err != nil {
+			envErrs = append(envErrs, err)
+		}
+		return v
+	}
+	envDurationOr := func(key string, def time.Duration) time.Duration {
+		v, err := envDuration(key, def)
+		if err != nil {
+			envErrs = append(envErrs, err)
+		}
+		return v
+	}
 
 	var useRSA, useECDSA, useEd25519 bool
 
-	flag.BoolVar(&useRSA, "rsa", envBoolOrDefault("CERTD_RSA", defaultRSA),
+	flag.BoolVar(&useRSA, "rsa", envBoolOr("CERTD_RSA", defaultRSA),
 		"Generate and manage RSA 4096 certificate (env: CERTD_RSA)")
-	flag.BoolVar(&useECDSA, "ecdsa", envBoolOrDefault("CERTD_ECDSA", defaultECDSA),
+	flag.BoolVar(&useECDSA, "ecdsa", envBoolOr("CERTD_ECDSA", defaultECDSA),
 		"Generate and manage ECDSA P-256 certificate (env: CERTD_ECDSA)")
-	flag.BoolVar(&useEd25519, "ed25519", envBoolOrDefault("CERTD_ED25519", defaultEd25519),
+	flag.BoolVar(&useEd25519, "ed25519", envBoolOr("CERTD_ED25519", defaultEd25519),
 		"Generate and manage Ed25519 certificate (env: CERTD_ED25519)")
 
 	cfg := &config{}
 
 	// Duration flags: parse env var default through parseDuration, then accept CLI override
-	lifetimeEnv := envDurationOrDefault("CERTD_LIFETIME", defaultLifetime, logger)
-	pollIntervalEnv := envDurationOrDefault("CERTD_POLL_INTERVAL", defaultPollInterval, logger)
+	lifetimeEnv := envDurationOr("CERTD_LIFETIME", defaultLifetime)
+	pollIntervalEnv := envDurationOr("CERTD_POLL_INTERVAL", defaultPollInterval)
 
 	var lifetimeStr, pollIntervalStr string
 	flag.StringVar(&lifetimeStr, "lifetime", "",
@@ -1947,7 +1970,7 @@ func parseConfig() *config {
 		"Directory for certificate and key files (env: CERTD_CERT_DIR)")
 	flag.StringVar(&cfg.notifyDir, "notify-dir", envOrDefault("CERTD_NOTIFY_DIR", defaultNotifyDir),
 		"Directory for per-algorithm notification files (env: CERTD_NOTIFY_DIR)")
-	flag.BoolVar(&cfg.internalIP, "internal-ip", envBoolOrDefault("CERTD_INTERNAL_IP", defaultInternalIP),
+	flag.BoolVar(&cfg.internalIP, "internal-ip", envBoolOr("CERTD_INTERNAL_IP", defaultInternalIP),
 		"Include internal IPs in certificate SANs (env: CERTD_INTERNAL_IP)")
 	var extraSANsStr string
 	flag.StringVar(&extraSANsStr, "extra-sans", envOrDefault("CERTD_EXTRA_SANS", ""),
@@ -1957,9 +1980,9 @@ func parseConfig() *config {
 	flag.StringVar(&interfacesStr, "interfaces", envOrDefault("CERTD_INTERFACES", ""),
 		`Interfaces to take internal IPs from: "`+interfacesDefaultRoute+`" (the default), "`+interfacesAll+
 			`" for every non-loopback interface, or a comma-separated list of names (env: CERTD_INTERFACES)`)
-	flag.BoolVar(&cfg.externalIP, "external-ip", envBoolOrDefault("CERTD_EXTERNAL_IP", defaultExternalIP),
+	flag.BoolVar(&cfg.externalIP, "external-ip", envBoolOr("CERTD_EXTERNAL_IP", defaultExternalIP),
 		"Include external IP in certificate SANs (env: CERTD_EXTERNAL_IP)")
-	flag.IntVar(&cfg.maxRetries, "max-retries", envIntOrDefault("CERTD_MAX_RETRIES", defaultMaxRetries),
+	flag.IntVar(&cfg.maxRetries, "max-retries", envIntOr("CERTD_MAX_RETRIES", defaultMaxRetries),
 		"Max retries for external IP detection (env: CERTD_MAX_RETRIES)")
 	flag.StringVar(&cfg.httpAddr, "http-addr", envOrDefault("CERTD_HTTP_ADDR", defaultHTTPAddr),
 		"Address for HTTP health/metrics server, empty string to disable (env: CERTD_HTTP_ADDR)")
@@ -1971,6 +1994,13 @@ func parseConfig() *config {
 	if cfg.version {
 		printVersion()
 		os.Exit(0)
+	}
+
+	if len(envErrs) > 0 {
+		for _, err := range envErrs {
+			fmt.Fprintf(os.Stderr, "invalid environment configuration: %v\n", err)
+		}
+		os.Exit(1)
 	}
 
 	// Resolve lifetime: CLI flag overrides env var
@@ -2028,21 +2058,21 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
-func envDurationOrDefault(key string, def time.Duration, logger *slog.Logger) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		d, err := parseDuration(v)
-		if err != nil {
-			logger.Warn("invalid duration in env var, using default",
-				"key", key,
-				"value", v,
-				"default", def,
-				"err", err,
-			)
-			return def
-		}
-		return d
+// The three readers below share a rule: an unset variable takes the default, and
+// anything that cannot be understood is an error rather than a silent fallback.
+// A misspelt value that quietly becomes the default is worse than no value at
+// all, because the daemon runs with settings nobody chose and nothing says so.
+
+func envDuration(key string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
 	}
-	return def
+	d, err := parseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	return d, nil
 }
 
 // extendedDurationRe matches a number followed by y, w, or d.
@@ -2151,20 +2181,35 @@ func splitList(value string) []string {
 	return items
 }
 
-func envBoolOrDefault(key string, def bool) bool {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
+// envBool accepts only "true" and "false", in any case. Everything else is
+// rejected, including spellings such as "yes", "on" and "1": the previous
+// reader treated every value it did not recognise as false, so a variable meant
+// to switch something on switched it off instead, without a word.
+func envBool(key string, def bool) (bool, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	switch {
+	case v == "":
+		return def, nil
+	case strings.EqualFold(v, "true"):
+		return true, nil
+	case strings.EqualFold(v, "false"):
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s: %q is not a boolean, use true or false", key, v)
 	}
-	return strings.EqualFold(v, "true") || v == "1"
 }
 
-func envIntOrDefault(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		var i int
-		if _, err := fmt.Sscanf(v, "%d", &i); err == nil {
-			return i
-		}
+// envInt requires the whole value to be a number. Sscanf stopped at the first
+// character it could not read, so "3.9" was 3 and "5x" was 5 — a typo became a
+// different, valid-looking setting.
+func envInt(key string, def int) (int, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
 	}
-	return def
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q is not a whole number", key, v)
+	}
+	return n, nil
 }
