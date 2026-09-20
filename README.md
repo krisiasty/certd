@@ -384,6 +384,28 @@ A useful alerting rule for expiring certificates:
     description: "Algorithm {{ $labels.algorithm }} expires in {{ $value | humanizeDuration }}"
 ```
 
+## Failure behaviour
+
+A failure that a later poll could clear — an external IP provider that is down, interface enumeration that
+fails, a certificate that could not be written — is logged, counted in `certd_cert_errors_total`, and retried
+on the next poll. `certd` stays running and keeps serving the certificates already on disk.
+
+A failure that cannot clear ends the process instead, so that systemd sees it: invalid configuration, an HTTP
+address already in use, or a hostname that cannot be read. The unit restarts `certd` every ten seconds and
+gives up after five attempts, leaving the unit in the `failed` state:
+
+```ini
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+```
+
+The start limit matters. Without it, `RestartSec=10` spaces restarts far enough apart that systemd's default
+limit of five starts within ten seconds can never be reached, and a permanently broken `certd` restarts
+indefinitely without ever reaching `failed` — so `systemctl is-failed` and anything built on it stay quiet.
+After it gives up, fix the cause and run `systemctl reset-failed certd` before starting it again.
+
 ## Security
 
 `certd` runs as a dedicated unprivileged system user `certd` with no login shell and no home directory.

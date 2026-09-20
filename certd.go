@@ -445,7 +445,14 @@ func checkAll(
 	// Gather host info once — shared across all algorithms in this cycle
 	hostname, err := os.Hostname()
 	if err != nil {
-		return false, fmt.Errorf("getting hostname: %w", err)
+		// Reaching this needs two things at once, and the error names neither:
+		// the uname result must be unusable — an empty hostname, or one of
+		// exactly 64 characters, which Go treats as possibly truncated — and
+		// the /proc fallback must be unavailable, as it is under
+		// ProcSubset=pid. Neither clears by itself, so this stays on the
+		// unrecoverable path rather than being retried.
+		return false, fmt.Errorf("getting hostname: %w; on Linux this happens when the hostname is "+
+			"empty or exactly 64 characters and /proc/sys is not visible, as under ProcSubset=pid", err)
 	}
 
 	discovery := addressDiscovery{internalComplete: true, externalComplete: true}
