@@ -1804,6 +1804,40 @@ func TestParseDurationRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestPackagedUnitGivesUpAfterRepeatedFailures(t *testing.T) {
+	t.Parallel()
+
+	unit, err := embeddedFiles.ReadFile("files/etc/systemd/system/certd.service")
+	if err != nil {
+		t.Fatalf("reading the packaged unit: %v", err)
+	}
+	text := string(unit)
+
+	// RestartSec spaces restarts out, so with systemd's default limit of five
+	// starts in ten seconds the limit can never be reached: a permanently
+	// failing certd would restart forever and never enter the failed state that
+	// monitoring watches for.
+	directives := []string{"StartLimitIntervalSec=", "StartLimitBurst="}
+	for _, directive := range directives {
+		if !strings.Contains(text, directive) {
+			t.Fatalf("the unit does not set %s, so a permanent failure would restart indefinitely", directive)
+		}
+	}
+
+	// Both belong to [Unit]. systemd moved them out of [Service] in v229 and
+	// warns about them there, which would leave the defaults in force while the
+	// unit looked as though it had configured them.
+	unitSection, _, found := strings.Cut(text, "\n[Service]")
+	if !found {
+		t.Fatal("the packaged unit has no [Service] section")
+	}
+	for _, directive := range directives {
+		if !strings.Contains(unitSection, directive) {
+			t.Fatalf("%s is set outside the [Unit] section, where systemd ignores it", directive)
+		}
+	}
+}
+
 func TestREADMEDocumentsActualDefaults(t *testing.T) {
 	t.Parallel()
 

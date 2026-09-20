@@ -19,6 +19,26 @@ Dependent services are notified via filesystem notification files watched by sys
 
 ## Installation
 
+### Requirements
+
+The packaged unit is written for **systemd 247 or newer**. It loads on older releases, but systemd logs
+directives it does not recognise as `Unknown lvalue` and ignores them, so an older release silently applies
+less hardening than the unit appears to describe:
+
+| Directive                               | Added in systemd |
+|-----------------------------------------|------------------|
+| `ProcSubset=`, `ProtectProc=`           | 247              |
+| `ProtectClock=`                         | 245              |
+| `ProtectKernelLogs=`                    | 244              |
+| `ProtectHostname=`, `RestrictSUIDSGID=` | 242              |
+| `StateDirectory=`, `LockPersonality=`   | 235              |
+
+Below 235 the unit does not work at all: `StateDirectory=` is ignored, `/var/lib/certd` is never created, and
+`certd` cannot write its certificates. That rules out RHEL 7 and SLES 12. Between 235 and 246 the unit runs,
+but the `/proc` restrictions are not in force.
+
+### Installing
+
 ```sh
 sudo certd -install
 ```
@@ -383,6 +403,28 @@ A useful alerting rule for expiring certificates:
     summary: "certd certificate expiring in less than 30 days"
     description: "Algorithm {{ $labels.algorithm }} expires in {{ $value | humanizeDuration }}"
 ```
+
+## Failure behaviour
+
+A failure that a later poll could clear — an external IP provider that is down, interface enumeration that
+fails, a certificate that could not be written — is logged, counted in `certd_cert_errors_total`, and retried
+on the next poll. `certd` stays running and keeps serving the certificates already on disk.
+
+A failure that cannot clear ends the process instead, so that systemd sees it: invalid configuration, an HTTP
+address already in use, or a hostname that cannot be read. The unit restarts `certd` every ten seconds and
+gives up after five attempts, leaving the unit in the `failed` state:
+
+```ini
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+```
+
+The start limit matters. Without it, `RestartSec=10` spaces restarts far enough apart that systemd's default
+limit of five starts within ten seconds can never be reached, and a permanently broken `certd` restarts
+indefinitely without ever reaching `failed` — so `systemctl is-failed` and anything built on it stay quiet.
+After it gives up, fix the cause and run `systemctl reset-failed certd` before starting it again.
 
 ## Security
 

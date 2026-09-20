@@ -4,6 +4,16 @@ Documentation=https://github.com/krisiasty/certd
 After=network-online.target
 Wants=network-online.target
 
+# Give up after repeated failures rather than restarting forever. RestartSec
+# below spaces restarts ten seconds apart, so systemd's default limit of five
+# starts within ten seconds can never be reached: without these, a permanently
+# failing certd would restart every ten seconds indefinitely and never enter the
+# failed state that monitoring looks for.
+# StartLimitIntervalSec and StartLimitBurst belong to [Unit]; systemd moved them
+# out of [Service] in v229 and warns if they are set there.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 # Certificate notification path units are opt-in.
 # See the README for certd-notify-<algorithm>@<service>.path usage.
 
