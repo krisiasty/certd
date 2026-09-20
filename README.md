@@ -82,10 +82,23 @@ The table lists the defaults built into `certd`. The packaged systemd unit sets 
 default installation runs with the unit's values rather than these; see [files/etc/systemd/system/certd.service](files/etc/systemd/system/certd.service).
 `GOMAXPROCS` has no `certd` default at all — the Go runtime uses the CPU count unless the unit pins it to `1`.
 
-`CERTD_LIFETIME` must be at least `1h` and `CERTD_POLL_INTERVAL` at least `1m`. Re-issuing restarts every
-dependent service, so rotating faster than that costs more than the shorter lifetime is worth.
-At the other end, a duration cannot exceed about 292 years, the largest a Go `time.Duration` can hold; anything
-longer is rejected rather than wrapped around into a short or negative value.
+Each setting is bounded at both ends, and a value outside its range is rejected at startup:
+
+| Setting               | Range         |
+|-----------------------|---------------|
+| `CERTD_LIFETIME`      | `1h` to `25y` |
+| `CERTD_POLL_INTERVAL` | `1m` to `1d`  |
+| `CERTD_MAX_RETRIES`   | `1` to `10`   |
+
+Re-issuing restarts every dependent service, so rotating faster than an hour costs more than the shorter
+lifetime is worth. At the other end `certd` issues self-signed certificates with no revocation path, so the
+lifetime is the whole window in which a leaked key stays usable; 25 years already outlives the host it
+identifies. A poll interval longer than a day would leave a hostname or address change unnoticed for that long,
+which is the very thing `certd` runs to catch.
+
+`CERTD_MAX_RETRIES` is bounded because the external IP backoff doubles from one second and sleeps after every
+attempt, so the count buys roughly `2^n` seconds of delay within a single poll. Ten retries cost about twenty
+minutes; twenty would cost twelve days, and hold back the systemd readiness notification for just as long.
 
 The two must also agree with each other. Renewal begins once less than one third of the lifetime remains, and
 `certd` only notices at a poll, so a poll has to fall inside that window: `CERTD_POLL_INTERVAL` must be shorter

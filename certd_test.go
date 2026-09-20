@@ -29,35 +29,35 @@ func TestRunRejectsInvalidConfigBeforeSideEffects(t *testing.T) {
 			configure: func(cfg *config) {
 				cfg.pollInterval = 0
 			},
-			wantError: "poll interval must be at least",
+			wantError: "poll interval must be between",
 		},
 		{
 			name: "negative poll interval",
 			configure: func(cfg *config) {
 				cfg.pollInterval = -time.Second
 			},
-			wantError: "poll interval must be at least",
+			wantError: "poll interval must be between",
 		},
 		{
 			name: "poll interval below minimum",
 			configure: func(cfg *config) {
 				cfg.pollInterval = time.Second
 			},
-			wantError: "poll interval must be at least",
+			wantError: "poll interval must be between",
 		},
 		{
 			name: "zero certificate lifetime",
 			configure: func(cfg *config) {
 				cfg.lifetime = 0
 			},
-			wantError: "certificate lifetime must be at least",
+			wantError: "certificate lifetime must be between",
 		},
 		{
 			name: "certificate lifetime below minimum",
 			configure: func(cfg *config) {
 				cfg.lifetime = 30 * time.Minute
 			},
-			wantError: "certificate lifetime must be at least",
+			wantError: "certificate lifetime must be between",
 		},
 		{
 			name: "poll interval too long to renew in time",
@@ -73,7 +73,30 @@ func TestRunRejectsInvalidConfigBeforeSideEffects(t *testing.T) {
 				cfg.externalIP = true
 				cfg.maxRetries = 0
 			},
-			wantError: "maximum retries must be positive",
+			wantError: "maximum retries must be between",
+		},
+		{
+			name: "certificate lifetime above maximum",
+			configure: func(cfg *config) {
+				cfg.lifetime = maxLifetime + time.Hour
+			},
+			wantError: "certificate lifetime must be between",
+		},
+		{
+			name: "poll interval above maximum",
+			configure: func(cfg *config) {
+				cfg.lifetime = maxLifetime
+				cfg.pollInterval = maxPollInterval + time.Minute
+			},
+			wantError: "poll interval must be between",
+		},
+		{
+			name: "more retries than permitted",
+			configure: func(cfg *config) {
+				cfg.externalIP = true
+				cfg.maxRetries = maxRetries + 1
+			},
+			wantError: "maximum retries must be between",
 		},
 	}
 
@@ -112,6 +135,8 @@ func TestValidateConfigAcceptsConfigurationsThatCanRenewInTime(t *testing.T) {
 		{name: "packaged unit", lifetime: defaultLifetime, pollInterval: 5 * time.Minute},
 		{name: "shortest permitted lifetime", lifetime: minLifetime, pollInterval: minPollInterval},
 		{name: "poll just inside the renewal window", lifetime: 3 * time.Hour, pollInterval: time.Hour - time.Second},
+		{name: "documented override example", lifetime: 10 * 8760 * time.Hour, pollInterval: 5 * time.Minute},
+		{name: "widest permitted pairing", lifetime: maxLifetime, pollInterval: maxPollInterval},
 	}
 
 	for _, tt := range tests {
@@ -987,6 +1012,43 @@ func TestNeedsRenewal(t *testing.T) {
 			if got := needsRenewal(cert, renewThreshold); got != tt.want {
 				t.Fatalf("needsRenewal with %s of %s remaining = %t, want %t",
 					tt.remaining, span, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHumanDuration(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input time.Duration
+		want  string
+	}{
+		{name: "whole years", input: 25 * 8760 * time.Hour, want: "25y"},
+		{name: "one year", input: 8760 * time.Hour, want: "1y"},
+		{name: "whole days", input: 24 * time.Hour, want: "1d"},
+		{name: "whole hours", input: time.Hour, want: "1h"},
+		{name: "whole minutes", input: time.Minute, want: "1m"},
+		{name: "sub-minute precision", input: 90500 * time.Millisecond, want: "1m30.5s"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := humanDuration(tt.input)
+			if got != tt.want {
+				t.Fatalf("humanDuration(%s) = %q, want %q", tt.input, got, tt.want)
+			}
+			// Whatever it prints must read back as the same duration, since the
+			// value is shown to operators as something to put in the config.
+			parsed, err := parseDuration(got)
+			if err != nil {
+				t.Fatalf("humanDuration(%s) = %q, which does not parse: %v", tt.input, got, err)
+			}
+			if parsed != tt.input {
+				t.Fatalf("humanDuration(%s) = %q, which parses back as %s", tt.input, got, parsed)
 			}
 		})
 	}

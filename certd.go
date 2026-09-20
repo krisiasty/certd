@@ -190,6 +190,19 @@ const (
 	minLifetime     = 1 * time.Hour
 	minPollInterval = 1 * time.Minute
 
+	// Upper bounds. certd issues self-signed certificates with no revocation
+	// path, so the lifetime is the whole compromise window; 25y is already far
+	// beyond the life of the host it identifies. A poll interval above a day
+	// stops certd doing the job it exists for, since a hostname or address
+	// change goes unnoticed for that long. And the external IP backoff doubles
+	// from a second and sleeps after every attempt, so the retry count buys
+	// 2^n seconds of delay in a single cycle: ten costs about twenty minutes,
+	// twenty would cost twelve days and block startup readiness for the same.
+	maxLifetime     = 25 * 8760 * time.Hour
+	maxPollInterval = 24 * time.Hour
+	minRetries      = 1
+	maxRetries      = 10
+
 	defaultRSA        = false
 	defaultECDSA      = false
 	defaultEd25519    = false
@@ -331,11 +344,13 @@ func validateConfig(cfg *config) error {
 	if len(cfg.algorithms) == 0 {
 		return errors.New("at least one certificate algorithm must be enabled")
 	}
-	if cfg.lifetime < minLifetime {
-		return fmt.Errorf("certificate lifetime must be at least %s, got %s", minLifetime, cfg.lifetime)
+	if cfg.lifetime < minLifetime || cfg.lifetime > maxLifetime {
+		return fmt.Errorf("certificate lifetime must be between %s and %s, got %s",
+			humanDuration(minLifetime), humanDuration(maxLifetime), humanDuration(cfg.lifetime))
 	}
-	if cfg.pollInterval < minPollInterval {
-		return fmt.Errorf("poll interval must be at least %s, got %s", minPollInterval, cfg.pollInterval)
+	if cfg.pollInterval < minPollInterval || cfg.pollInterval > maxPollInterval {
+		return fmt.Errorf("poll interval must be between %s and %s, got %s",
+			humanDuration(minPollInterval), humanDuration(maxPollInterval), humanDuration(cfg.pollInterval))
 	}
 	// Renewal only begins once less than renewThreshold of the lifetime remains,
 	// and certd notices no sooner than the next poll, so a poll has to fall
@@ -353,8 +368,11 @@ func validateConfig(cfg *config) error {
 			time.Duration(float64(cfg.pollInterval)/renewThreshold).Round(time.Second),
 		)
 	}
-	if cfg.externalIP && cfg.maxRetries <= 0 {
-		return fmt.Errorf("maximum retries must be positive when external IP detection is enabled, got %d", cfg.maxRetries)
+	if cfg.externalIP && (cfg.maxRetries < minRetries || cfg.maxRetries > maxRetries) {
+		return fmt.Errorf(
+			"maximum retries must be between %d and %d when external IP detection is enabled, got %d",
+			minRetries, maxRetries, cfg.maxRetries,
+		)
 	}
 	return nil
 }
@@ -1584,6 +1602,25 @@ func envDurationOrDefault(key string, def time.Duration, logger *slog.Logger) ti
 
 // extendedDurationRe matches a number followed by y, w, or d.
 var extendedDurationRe = regexp.MustCompile(`(\d+)(y|w|d)`)
+
+// humanDuration renders a duration using the extended units parseDuration
+// accepts, so a configuration bound reads as "25y" rather than "219000h0m0s".
+// Whatever it returns parses back to the same value, because operators are
+// expected to copy it into their configuration.
+func humanDuration(d time.Duration) string {
+	switch {
+	case d >= 8760*time.Hour && d%(8760*time.Hour) == 0:
+		return fmt.Sprintf("%dy", d/(8760*time.Hour))
+	case d >= 24*time.Hour && d%(24*time.Hour) == 0:
+		return fmt.Sprintf("%dd", d/(24*time.Hour))
+	case d >= time.Hour && d%time.Hour == 0:
+		return fmt.Sprintf("%dh", d/time.Hour)
+	case d >= time.Minute && d%time.Minute == 0:
+		return fmt.Sprintf("%dm", d/time.Minute)
+	default:
+		return d.String()
+	}
+}
 
 // maxDuration is the largest value a time.Duration can represent, a little over
 // 292 years. Any input implying more than this is rejected rather than wrapped.
