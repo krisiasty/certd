@@ -97,10 +97,11 @@ identifies. A poll interval longer than a day would leave a hostname or address 
 which is the very thing `certd` runs to catch.
 
 `CERTD_MAX_RETRIES` is bounded because every retry delays the poll it belongs to. The delay between external IP
-attempts doubles from one second and then holds at sixteen, so the default of five retries waits 31 seconds in
-total and the maximum of ten waits about two minutes. Without that ceiling each retry would cost as much as all
-the ones before it together: ten retries would wait seventeen minutes and twenty would wait twelve days, holding
-back the systemd readiness notification for just as long.
+attempts doubles from one second and then holds at sixteen, and nothing is waited after the final attempt, so
+the default of five retries waits 15 seconds in total and the maximum of ten waits 1 minute 35 seconds. Without
+that ceiling each retry would cost as much as all the ones before it together: ten retries would wait about
+seventeen minutes and twenty would wait twelve days, holding back the systemd readiness notification just as
+long, since it is only sent once the first check completes.
 
 The two must also agree with each other. Renewal begins once less than one third of the lifetime remains, and
 `certd` only notices at a poll, so a poll has to fall inside that window: `CERTD_POLL_INTERVAL` must be shorter

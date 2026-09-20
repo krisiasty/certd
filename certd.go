@@ -782,6 +782,12 @@ func getExternalIPWithRetry(ctx context.Context, maxRetries int, logger *slog.Lo
 			return ip, nil
 		}
 		lastErr = err
+		// The delay belongs between attempts, so there is none after the last
+		// one: waiting there only postpones the error already being returned,
+		// and does so for the longest interval of the whole schedule.
+		if attempt == maxRetries {
+			break
+		}
 		logger.Warn("failed to get external IP, will retry",
 			"attempt", attempt,
 			"maxRetries", maxRetries,

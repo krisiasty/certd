@@ -1017,6 +1017,53 @@ func TestNeedsRenewal(t *testing.T) {
 	}
 }
 
+// withFailingExternalIPProviders points external IP detection at a URL that
+// fails when the request is built, so the retry loop runs without touching the
+// network and without waiting for a timeout.
+func withFailingExternalIPProviders(t *testing.T) {
+	t.Helper()
+
+	restore := externalIPProviders
+	t.Cleanup(func() { externalIPProviders = restore })
+	externalIPProviders = []string{"://invalid"}
+}
+
+func TestGetExternalIPWithRetryDoesNotWaitAfterTheFinalAttempt(t *testing.T) {
+	withFailingExternalIPProviders(t)
+
+	start := time.Now()
+	_, err := getExternalIPWithRetry(context.Background(), 1, slog.New(slog.DiscardHandler))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("getExternalIPWithRetry succeeded against a failing provider")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("a single attempt took %s; the delay after the final attempt is never used", elapsed)
+	}
+}
+
+func TestGetExternalIPWithRetryWaitsBetweenAttempts(t *testing.T) {
+	withFailingExternalIPProviders(t)
+
+	// Two attempts wait once, between them: the first delay of one second and
+	// no more. Guards against dropping the wait altogether while removing the
+	// unused one that followed the last attempt.
+	start := time.Now()
+	_, err := getExternalIPWithRetry(context.Background(), 2, slog.New(slog.DiscardHandler))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("getExternalIPWithRetry succeeded against a failing provider")
+	}
+	if elapsed < time.Second {
+		t.Fatalf("two attempts took %s; they did not wait between attempts", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("two attempts took %s; more than one delay was waited", elapsed)
+	}
+}
+
 func TestBackoffStopsDoublingAtTheCap(t *testing.T) {
 	t.Parallel()
 
@@ -1048,9 +1095,11 @@ func TestRetryBackoffStaysBoundedAtMaxRetries(t *testing.T) {
 	// exponential time: at the permitted maximum the last sleep alone would run
 	// for days, and because the first check gates the systemd readiness
 	// notification, it would hold up startup for just as long.
+	//
+	// n attempts wait n-1 times, since nothing is waited after the last one.
 	var total time.Duration
 	backoff := time.Second
-	for range maxRetries {
+	for range maxRetries - 1 {
 		total += backoff
 		backoff = nextBackoff(backoff)
 	}
