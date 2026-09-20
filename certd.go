@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -165,6 +166,7 @@ type config struct {
 	certDir      string
 	notifyDir    string
 	internalIP   bool
+	interfaces   []string
 	externalIP   bool
 	pollInterval time.Duration
 	maxRetries   int
@@ -212,6 +214,16 @@ const (
 	// same twenty retries cost four and a half minutes. The default of five
 	// never reaches the cap, so its schedule is unchanged.
 	maxBackoff = 16 * time.Second
+
+	// interfacesAll selects every non-loopback interface, which is what certd
+	// did before it learned to follow the default route.
+	interfacesAll = "all"
+
+	// defaultRouteProbe is in TEST-NET-1 (RFC 5737), reserved for documentation
+	// and never routed anywhere. Connecting a UDP socket to it transmits
+	// nothing; it only asks the kernel which route, and so which source
+	// address, the host would use to reach somewhere off-link.
+	defaultRouteProbe = "192.0.2.1:9"
 
 	defaultRSA        = false
 	defaultECDSA      = false
@@ -270,6 +282,7 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 		"certDir", cfg.certDir,
 		"notifyDir", cfg.notifyDir,
 		"internalIP", cfg.internalIP,
+		"interfaces", interfaceSelectionText(cfg.interfaces),
 		"externalIP", cfg.externalIP,
 		"pollInterval", cfg.pollInterval,
 		"maxRetries", cfg.maxRetries,
@@ -378,6 +391,12 @@ func validateConfig(cfg *config) error {
 			time.Duration(float64(cfg.pollInterval)/renewThreshold).Round(time.Second),
 		)
 	}
+	if len(cfg.interfaces) > 1 && slices.Contains(cfg.interfaces, interfacesAll) {
+		return fmt.Errorf(
+			"interface selection %q combines %q with named interfaces; name the interfaces, or use %q alone",
+			strings.Join(cfg.interfaces, ","), interfacesAll, interfacesAll,
+		)
+	}
 	// Both retry bounds are conditional because cfg.maxRetries has exactly one
 	// consumer, getExternalIPWithRetry, and that is only reached when external
 	// IP detection is enabled. With it off nothing retries and nothing waits,
@@ -418,7 +437,7 @@ func checkAll(
 
 	discovery := addressDiscovery{internalComplete: true, externalComplete: true}
 	if cfg.internalIP {
-		internalIPs, err := getInternalIPs()
+		internalIPs, err := getInternalIPs(ctx, cfg.interfaces, logger)
 		if err != nil {
 			logger.Warn("failed to get internal IPs, continuing without them", "err", err)
 			discovery.internalComplete = false
@@ -748,36 +767,142 @@ func generateEd25519(template *x509.Certificate) ([]byte, []byte, error) {
 	return certDER, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), nil
 }
 
-// getInternalIPs returns all non-loopback IPv4 addresses on the host.
-func getInternalIPs() ([]string, error) {
+// addressIP extracts the IP from an interface address, or nil if it carries none.
+func addressIP(addr net.Addr) net.IP {
+	switch v := addr.(type) {
+	case *net.IPNet:
+		return v.IP
+	case *net.IPAddr:
+		return v.IP
+	default:
+		return nil
+	}
+}
+
+// usableInternalIP reports whether an address belongs in a certificate.
+// Link-local addresses do not: 169.254/16 is what a host assigns itself when
+// DHCP has failed, so it appears when the lease is lost and disappears when it
+// returns, re-issuing the certificate each way to name an address that nothing
+// can reach the host on.
+func usableInternalIP(ip net.IP) bool {
+	return ip != nil && ip.To4() != nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast()
+}
+
+// defaultRouteInterface returns the interface carrying the host's default
+// route, the one it would use to reach anything not on a local network.
+//
+// A connected UDP socket transmits nothing: the kernel resolves the route and
+// picks the source address it would use, and that address identifies the
+// interface. An error means the host has no default route — an isolated
+// network, or a lapsed DHCP lease.
+func defaultRouteInterface(ctx context.Context) (string, error) {
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "udp", defaultRouteProbe)
+	if err != nil {
+		return "", fmt.Errorf("resolving default route: %w", err)
+	}
+	local, ok := conn.LocalAddr().(*net.UDPAddr)
+	if closeErr := conn.Close(); closeErr != nil {
+		return "", fmt.Errorf("closing default route probe: %w", closeErr)
+	}
+	if !ok || local.IP == nil {
+		return "", errors.New("default route probe reported no source address")
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("listing interfaces: %w", err)
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return "", fmt.Errorf("listing addresses of %s: %w", iface.Name, err)
+		}
+		for _, addr := range addrs {
+			if ip := addressIP(addr); ip != nil && ip.Equal(local.IP) {
+				return iface.Name, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no interface holds the default route source address %s", local.IP)
+}
+
+// selectedInterfaces resolves the configured selection to the interface names
+// whose addresses belong in the certificate, or nil when every non-loopback
+// interface qualifies.
+func selectedInterfaces(ctx context.Context, selection []string, logger *slog.Logger) map[string]struct{} {
+	if len(selection) == 1 && selection[0] == interfacesAll {
+		return nil
+	}
+	if len(selection) > 0 {
+		set := make(map[string]struct{}, len(selection))
+		for _, name := range selection {
+			set[name] = struct{}{}
+		}
+		return set
+	}
+
+	name, err := defaultRouteInterface(ctx)
+	if err != nil {
+		// Without a default route there is nothing to follow, so fall back to
+		// what certd did before: every non-loopback interface. Issuing a
+		// certificate with no addresses at all would be worse.
+		logger.Warn("no default route, falling back to every non-loopback interface", "err", err)
+		return nil
+	}
+	return map[string]struct{}{name: {}}
+}
+
+// getInternalIPs returns the IPv4 addresses of the selected interfaces.
+func getInternalIPs(ctx context.Context, selection []string, logger *slog.Logger) ([]string, error) {
+	wanted := selectedInterfaces(ctx, selection, logger)
+
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, fmt.Errorf("listing interfaces: %w", err)
 	}
+
 	var ips []string
+	found := make(map[string]struct{}, len(wanted))
 	for _, iface := range ifaces {
+		if wanted != nil {
+			if _, ok := wanted[iface.Name]; !ok {
+				continue
+			}
+			found[iface.Name] = struct{}{}
+		}
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
 		addrs, err := iface.Addrs()
 		if err != nil {
-			continue
+			// Skipping would return a list the caller cannot tell from a
+			// complete one, and the addresses left out of it look to the caller
+			// like addresses that have gone away, so they get pruned from the
+			// certificate. Report the failure instead of hiding it.
+			return nil, fmt.Errorf("listing addresses of %s: %w", iface.Name, err)
 		}
 		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
+			if ip := addressIP(addr); usableInternalIP(ip) {
+				ips = append(ips, ip.String())
 			}
-			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
-				continue
-			}
-			ips = append(ips, ip.String())
+		}
+	}
+
+	for name := range wanted {
+		if _, ok := found[name]; !ok {
+			logger.Warn("configured interface does not exist", "interface", name)
 		}
 	}
 	return ips, nil
+}
+
+// interfaceSelectionText describes an interface selection for logging.
+func interfaceSelectionText(selection []string) string {
+	if len(selection) == 0 {
+		return "default route"
+	}
+	return strings.Join(selection, ",")
 }
 
 // retryBackoffBudget returns the delay getExternalIPWithRetry spends waiting
@@ -1579,6 +1704,10 @@ func parseConfig() *config {
 		"Directory for per-algorithm notification files (env: CERTD_NOTIFY_DIR)")
 	flag.BoolVar(&cfg.internalIP, "internal-ip", envBoolOrDefault("CERTD_INTERNAL_IP", defaultInternalIP),
 		"Include internal IPs in certificate SANs (env: CERTD_INTERNAL_IP)")
+	var interfacesStr string
+	flag.StringVar(&interfacesStr, "interfaces", envOrDefault("CERTD_INTERFACES", ""),
+		`Interfaces to take internal IPs from: a comma-separated list, "`+interfacesAll+
+			`" for every non-loopback interface, or empty to follow the default route (env: CERTD_INTERFACES)`)
 	flag.BoolVar(&cfg.externalIP, "external-ip", envBoolOrDefault("CERTD_EXTERNAL_IP", defaultExternalIP),
 		"Include external IP in certificate SANs (env: CERTD_EXTERNAL_IP)")
 	flag.IntVar(&cfg.maxRetries, "max-retries", envIntOrDefault("CERTD_MAX_RETRIES", defaultMaxRetries),
@@ -1616,6 +1745,8 @@ func parseConfig() *config {
 		}
 		cfg.pollInterval = d
 	}
+
+	cfg.interfaces = splitList(interfacesStr)
 
 	// Build algorithm list — default to ECDSA if none specified
 	if useRSA {
@@ -1750,6 +1881,18 @@ func parseDuration(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid duration %q", s)
 	}
 	return total, nil
+}
+
+// splitList parses a comma-separated setting, discarding surrounding spaces and
+// empty entries so that "eth0, eth1" and a trailing comma both behave.
+func splitList(value string) []string {
+	var items []string
+	for item := range strings.SplitSeq(value, ",") {
+		if trimmed := strings.TrimSpace(item); trimmed != "" {
+			items = append(items, trimmed)
+		}
+	}
+	return items
 }
 
 func envBoolOrDefault(key string, def bool) bool {

@@ -69,6 +69,7 @@ Environment=CERTD_EXTERNAL_IP=false
 | `CERTD_CERT_DIR`       | `-cert-dir`       | `/var/lib/certd`      | Directory where certificate and key files are written                                                            |
 | `CERTD_NOTIFY_DIR`     | `-notify-dir`     | `/run/certd`          | Directory where notification files are written after a certificate is issued or renewed                          |
 | `CERTD_INTERNAL_IP`    | `-internal-ip`    | `false`               | Include non-loopback IPv4 addresses of local interfaces in certificate SANs                                      |
+| `CERTD_INTERFACES`     | `-interfaces`     | default route         | Interfaces to take internal IPs from: names, `all`, or empty to follow the default route                         |
 | `CERTD_EXTERNAL_IP`    | `-external-ip`    | `false`               | Detect and include the external (NAT) IPv4 address in certificate SANs                                           |
 | `CERTD_POLL_INTERVAL`  | `-poll-interval`  | `1h`                  | How often to check for hostname/IP changes and certificate expiry                                                |
 | `CERTD_MAX_RETRIES`    | `-max-retries`    | `5`                   | Maximum number of retries for external IP detection, with exponential backoff                                    |
@@ -154,7 +155,28 @@ Every certificate always includes the following Subject Alternative Names:
 - `localhost`
 - `127.0.0.1`
 
-When `CERTD_INTERNAL_IP=true`, all non-loopback IPv4 addresses of active network interfaces are also added.
+When `CERTD_INTERNAL_IP=true`, the host's own IPv4 addresses are added. By default they are taken from the
+interface carrying the default route, which keeps container and virtual bridges such as `docker0`, `br-*` and
+`virbr0` out of the certificate. Those appear and disappear as containers and networks are created and removed,
+and every change would re-issue the certificate and restart each dependent service.
+
+`CERTD_INTERFACES` selects where the addresses come from:
+
+| Value               | Meaning                                  |
+|---------------------|------------------------------------------|
+| empty (the default) | The interface carrying the default route |
+| `all`               | Every non-loopback interface             |
+| `eth0,eth1`         | Exactly the interfaces named             |
+
+A host that serves on more than one network needs `all` or an explicit list, or the addresses on its other
+networks are left out of the certificate.
+
+A host with no default route at all — air-gapped, on an isolated segment, or with a lapsed DHCP lease — falls
+back to every non-loopback interface and logs a warning.
+
+Link-local addresses (`169.254.0.0/16`) are never included. A host assigns itself one when DHCP fails, so
+including it would re-issue the certificate when the lease is lost and again when it returns, each time to name
+an address nothing can reach the host on.
 
 When `CERTD_EXTERNAL_IP=true`, `certd` queries several external IP providers in order and adds the first valid IPv4 response:
 

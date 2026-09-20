@@ -91,6 +91,13 @@ func TestRunRejectsInvalidConfigBeforeSideEffects(t *testing.T) {
 			wantError: "poll interval must be between",
 		},
 		{
+			name: "interface selection mixes all with names",
+			configure: func(cfg *config) {
+				cfg.interfaces = []string{interfacesAll, "eth0"}
+			},
+			wantError: "combines",
+		},
+		{
 			name: "more retries than permitted",
 			configure: func(cfg *config) {
 				cfg.externalIP = true
@@ -1113,6 +1120,147 @@ func TestGetExternalIPWithRetryWaitsBetweenAttempts(t *testing.T) {
 	}
 	if elapsed > 2*time.Second {
 		t.Fatalf("two attempts took %s; more than one delay was waited", elapsed)
+	}
+}
+
+func TestSplitList(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{name: "empty", input: "", want: nil},
+		{name: "single", input: "eth0", want: []string{"eth0"}},
+		{name: "several", input: "eth0,eth1", want: []string{"eth0", "eth1"}},
+		{name: "spaces around entries", input: " eth0 , eth1 ", want: []string{"eth0", "eth1"}},
+		{name: "trailing comma", input: "eth0,", want: []string{"eth0"}},
+		{name: "only separators", input: " , ", want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := splitList(tt.input)
+			if len(got) != len(tt.want) {
+				t.Fatalf("splitList(%q) = %#v, want %#v", tt.input, got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Fatalf("splitList(%q) = %#v, want %#v", tt.input, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestSelectedInterfaces(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.DiscardHandler)
+
+	if got := selectedInterfaces(t.Context(), []string{interfacesAll}, logger); got != nil {
+		t.Fatalf("selecting %q restricted the interfaces to %v, want every one", interfacesAll, got)
+	}
+
+	got := selectedInterfaces(t.Context(), []string{"eth0", "eth1"}, logger)
+	if len(got) != 2 {
+		t.Fatalf("named selection = %v, want two entries", got)
+	}
+	for _, name := range []string{"eth0", "eth1"} {
+		if _, ok := got[name]; !ok {
+			t.Fatalf("named selection = %v, want it to contain %q", got, name)
+		}
+	}
+}
+
+func TestGetInternalIPsSelectionNarrowsTheResult(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.DiscardHandler)
+
+	all, err := getInternalIPs(t.Context(), []string{interfacesAll}, logger)
+	if err != nil {
+		t.Fatalf("enumerating every interface: %v", err)
+	}
+	if len(all) == 0 {
+		t.Skip("host has no usable IPv4 address to select between")
+	}
+
+	// Following the default route can only ever return a subset of what every
+	// interface offers, whichever interface this host actually routes through.
+	viaDefaultRoute, err := getInternalIPs(t.Context(), nil, logger)
+	if err != nil {
+		t.Fatalf("following the default route: %v", err)
+	}
+	for _, ip := range viaDefaultRoute {
+		if !stringSliceContains(all, ip) {
+			t.Fatalf("default route produced %s, which is not among %v", ip, all)
+		}
+	}
+
+	// An interface that does not exist contributes nothing, and is reported
+	// rather than failing the poll: interfaces can appear later.
+	none, err := getInternalIPs(t.Context(), []string{"certd-absent0"}, logger)
+	if err != nil {
+		t.Fatalf("selecting an absent interface: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("absent interface produced %v, want nothing", none)
+	}
+}
+
+func TestDefaultRouteInterfaceNamesAnInterfaceThatExists(t *testing.T) {
+	t.Parallel()
+
+	name, err := defaultRouteInterface(t.Context())
+	if err != nil {
+		t.Skipf("host has no default route: %v", err)
+	}
+	if _, err := net.InterfaceByName(name); err != nil {
+		t.Fatalf("default route named interface %q, which does not exist: %v", name, err)
+	}
+}
+
+func TestUsableInternalIP(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		ip   string
+		want bool
+	}{
+		{name: "private address", ip: "192.168.1.10", want: true},
+		{name: "public address", ip: "203.0.113.7", want: true},
+		{name: "container bridge address", ip: "172.17.0.1", want: true},
+		{name: "loopback", ip: "127.0.0.1", want: false},
+		// APIPA. It appears precisely when DHCP has failed and disappears when
+		// it recovers, so including it re-issues the certificate each way while
+		// naming an address nothing can be reached on.
+		{name: "link-local", ip: "169.254.23.45", want: false},
+		{name: "link-local at the edge of the range", ip: "169.254.255.255", want: false},
+		{name: "just below the link-local range", ip: "169.253.255.255", want: true},
+		{name: "IPv6", ip: "2001:db8::1", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ip := net.ParseIP(tt.ip)
+			if ip == nil {
+				t.Fatalf("test address %q does not parse", tt.ip)
+			}
+			if got := usableInternalIP(ip); got != tt.want {
+				t.Fatalf("usableInternalIP(%s) = %t, want %t", tt.ip, got, tt.want)
+			}
+		})
+	}
+
+	if usableInternalIP(nil) {
+		t.Fatal("usableInternalIP(nil) = true, want false")
 	}
 }
 
