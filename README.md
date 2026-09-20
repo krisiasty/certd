@@ -11,6 +11,7 @@ Dependent services are notified via filesystem notification files watched by sys
 - Multiple algorithms can be active simultaneously, each producing independent certificate files
 - Automatically detects hostname, internal IP addresses, and optionally the external (NAT) IP
 - Re-issues certificates on hostname or IP address changes
+- Re-issues certificates when `CERTD_LIFETIME` changes, so a new lifetime applies at the next poll
 - Renews certificates when less than one third of their lifetime remains
 - Notifies dependent services via per-algorithm notification files
 - Exposes an HTTP health and Prometheus metrics endpoint
@@ -80,6 +81,15 @@ ECDSA certificate — so enabling only `CERTD_RSA` yields RSA alone, not RSA alo
 The table lists the defaults built into `certd`. The packaged systemd unit sets most of these explicitly, so a
 default installation runs with the unit's values rather than these; see [files/etc/systemd/system/certd.service](files/etc/systemd/system/certd.service).
 `GOMAXPROCS` has no `certd` default at all — the Go runtime uses the CPU count unless the unit pins it to `1`.
+
+`CERTD_LIFETIME` must be at least `1h` and `CERTD_POLL_INTERVAL` at least `1m`. Re-issuing restarts every
+dependent service, so rotating faster than that costs more than the shorter lifetime is worth.
+
+The two must also agree with each other. Renewal begins once less than one third of the lifetime remains, and
+`certd` only notices at a poll, so a poll has to fall inside that window: `CERTD_POLL_INTERVAL` must be shorter
+than a third of `CERTD_LIFETIME`. A one-hour lifetime polled once an hour would expire before it was renewed, so
+`certd` refuses to start on such a pairing rather than letting the certificate lapse. With the default one-hour
+poll the shortest usable lifetime is just over three hours; the packaged unit polls every five minutes.
 
 ### CLI flags
 

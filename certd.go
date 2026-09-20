@@ -184,6 +184,12 @@ const (
 	// Every algorithm is off by default; parseConfig falls back to ECDSA when
 	// none was selected. Named alongside the rest so the documented defaults
 	// have a single source to be checked against.
+	// Lower bounds for the two interval settings. certd re-issues by touching a
+	// notification file, which restarts every dependent service, so rotating
+	// faster than this costs far more than the shorter lifetime is worth.
+	minLifetime     = 1 * time.Hour
+	minPollInterval = 1 * time.Minute
+
 	defaultRSA        = false
 	defaultECDSA      = false
 	defaultEd25519    = false
@@ -325,11 +331,27 @@ func validateConfig(cfg *config) error {
 	if len(cfg.algorithms) == 0 {
 		return errors.New("at least one certificate algorithm must be enabled")
 	}
-	if cfg.lifetime <= 0 {
-		return fmt.Errorf("certificate lifetime must be positive, got %s", cfg.lifetime)
+	if cfg.lifetime < minLifetime {
+		return fmt.Errorf("certificate lifetime must be at least %s, got %s", minLifetime, cfg.lifetime)
 	}
-	if cfg.pollInterval <= 0 {
-		return fmt.Errorf("poll interval must be positive, got %s", cfg.pollInterval)
+	if cfg.pollInterval < minPollInterval {
+		return fmt.Errorf("poll interval must be at least %s, got %s", minPollInterval, cfg.pollInterval)
+	}
+	// Renewal only begins once less than renewThreshold of the lifetime remains,
+	// and certd notices no sooner than the next poll, so a poll has to fall
+	// inside that window. Otherwise the certificate expires before it is renewed
+	// however generous the threshold looks.
+	renewWindow := time.Duration(float64(cfg.lifetime) * renewThreshold)
+	if cfg.pollInterval >= renewWindow {
+		return fmt.Errorf(
+			"poll interval %s is too long for a %s certificate lifetime: renewal begins with %s remaining, "+
+				"so no check would fall inside that window; use a poll interval under %s, or a lifetime over %s",
+			cfg.pollInterval,
+			cfg.lifetime,
+			renewWindow.Round(time.Second),
+			renewWindow.Round(time.Second),
+			time.Duration(float64(cfg.pollInterval)/renewThreshold).Round(time.Second),
+		)
 	}
 	if cfg.externalIP && cfg.maxRetries <= 0 {
 		return fmt.Errorf("maximum retries must be positive when external IP detection is enabled, got %d", cfg.maxRetries)
@@ -514,6 +536,18 @@ func checkOne(
 			"new", ipAddressesToStrings(issueIPs),
 		)
 		return issueAndNotify("IP SANs changed", issueIPs)
+	}
+
+	// Case: the configured lifetime no longer matches the certificate. The
+	// lifetime is part of the certificate this host should have, exactly like
+	// its hostname and its IP SANs, so a change applies at the next poll.
+	// Leaving it to the renewal check instead would measure the threshold
+	// against the span the old certificate happens to have: shortening the
+	// lifetime from a year to a month would then change nothing until the
+	// year-long certificate approached its own expiry, eight months later.
+	if span := cert.NotAfter.Sub(cert.NotBefore); span != cfg.lifetime {
+		logger.Info("configured certificate lifetime changed", "old", span, "new", cfg.lifetime)
+		return issueAndNotify("lifetime changed", issueIPs)
 	}
 
 	// Case: renewal due
@@ -766,7 +800,10 @@ func getExternalIP(ctx context.Context, logger *slog.Logger) (string, error) {
 	return "", errExternalIPCheckFailed
 }
 
-// needsRenewal returns true when less than threshold fraction of lifetime remains.
+// needsRenewal returns true when less than threshold fraction of lifetime
+// remains. The certificate's own span is the right measure here only because
+// the lifetime check above guarantees it equals the configured lifetime by the
+// time this runs.
 func needsRenewal(cert *x509.Certificate, threshold float64) bool {
 	lifetime := cert.NotAfter.Sub(cert.NotBefore)
 	remaining := time.Until(cert.NotAfter)
