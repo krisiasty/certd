@@ -567,6 +567,59 @@ func TestRemoveStagedFilesToleratesAMissingDirectory(t *testing.T) {
 	removeStagedFiles(cfg, logger) // must not panic or fail
 }
 
+func TestCheckAllRetriesAfterAHostnameFailure(t *testing.T) {
+	restore := osHostname
+	t.Cleanup(func() { osHostname = restore })
+	osHostname = func() (string, error) { return "", errors.New("hostname unavailable") }
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	cfg.algorithms = []algorithm{algorithmECDSA}
+	store := newStatusStore(cfg.algorithms)
+	states := map[algorithm]*certState{algorithmECDSA: {}}
+
+	// The poll loop ends the process on any error checkAll returns, so a
+	// transient failure here must report an unsuccessful cycle rather than a
+	// fatal one: every other per-cycle failure is logged and retried.
+	ok, err := checkAll(t.Context(), cfg, logger, states, store)
+	if err != nil {
+		t.Fatalf("checkAll = %v, want no error so the poll loop keeps running", err)
+	}
+	if ok {
+		t.Fatal("checkAll reported a successful cycle without a hostname")
+	}
+	if fileExists(paths.cert) || fileExists(paths.key) {
+		t.Fatal("a certificate was issued without a hostname")
+	}
+
+	// And the reason is visible where an operator would look for it.
+	if status := store.snapshot()[algorithmECDSA]; status.err == nil {
+		t.Fatal("the hostname failure was not recorded against the algorithm")
+	}
+}
+
+func TestRunStillFailsStartupWhenTheHostnameIsUnavailable(t *testing.T) {
+	restore := osHostname
+	t.Cleanup(func() { osHostname = restore })
+	osHostname = func() (string, error) { return "", errors.New("hostname unavailable") }
+
+	cfg, paths, logger := newTestCertificateConfig(t, false, false)
+	cfg.algorithms = []algorithm{algorithmECDSA}
+	cfg.pollInterval = time.Hour
+	cfg.maxRetries = defaultMaxRetries
+	cfg.httpAddr = ""
+
+	// Retrying applies to a daemon that is already running. A start that never
+	// completed its first check has nothing to serve and must not report
+	// readiness, so it still fails and systemd restarts it.
+	err := run(t.Context(), cfg, logger)
+	if err == nil || !strings.Contains(err.Error(), "initial certificate check failed") {
+		t.Fatalf("run = %v, want the initial check to fail", err)
+	}
+	if fileExists(paths.cert) {
+		t.Fatal("a certificate was issued without a hostname")
+	}
+}
+
 func TestCheckAllStopsIssuingWhenShuttingDown(t *testing.T) {
 	t.Parallel()
 

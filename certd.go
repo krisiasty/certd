@@ -239,6 +239,10 @@ const (
 	renewThreshold    = 1.0 / 3.0 // renew when less than 1/3 of lifetime remains
 )
 
+// osHostname is a variable so tests can make it fail. The real one almost
+// never does, which is precisely why its failure path needs covering.
+var osHostname = os.Hostname
+
 var externalIPProviders = []string{
 	"https://ipv4.icanhazip.com",
 	"https://checkip.amazonaws.com",
@@ -443,9 +447,19 @@ func checkAll(
 	store *statusStore,
 ) (bool, error) {
 	// Gather host info once — shared across all algorithms in this cycle
-	hostname, err := os.Hostname()
+	hostname, err := osHostname()
 	if err != nil {
-		return false, fmt.Errorf("getting hostname: %w", err)
+		// Every other failure in a cycle is logged and retried. Returning an
+		// error here instead ended the process, because the poll loop treats
+		// anything checkAll returns as fatal — so a momentary failure of a
+		// syscall that certd only reads cost it a restart. Without a hostname
+		// there is nothing to compare against or issue, so the cycle is
+		// abandoned and the next poll tries again.
+		logger.Error("could not determine hostname, skipping this check", "err", err)
+		for _, alg := range cfg.algorithms {
+			store.recordError(alg, fmt.Errorf("getting hostname: %w", err))
+		}
+		return false, nil
 	}
 
 	discovery := addressDiscovery{internalComplete: true, externalComplete: true}
