@@ -1058,6 +1058,20 @@ func getExternalIP(ctx context.Context, logger *slog.Logger) (string, error) {
 			logger.Warn("external IP provider request failed", "provider", provider, "err", err)
 			continue
 		}
+		// The body of an unsuccessful response is not an answer, however much
+		// it may look like one: a proxy or captive portal replying 429 or 503
+		// with something address-shaped is describing itself, not this host.
+		// Without this the first such reply is taken as the external address
+		// and the providers that would have answered are never asked.
+		if resp.StatusCode != http.StatusOK {
+			logger.Warn("external IP provider returned an unexpected status",
+				"provider", provider, "status", resp.Status)
+			if closeErr := resp.Body.Close(); closeErr != nil {
+				logger.Warn("external IP provider response body close failed",
+					"provider", provider, "err", closeErr)
+			}
+			continue
+		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
 		closeErr := resp.Body.Close()
 		if err != nil {
