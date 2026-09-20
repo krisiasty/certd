@@ -250,6 +250,26 @@ It is also the only way to certify an address the host cannot see at all. An AWS
 floating IP is translated by the network and never appears on an interface, so no amount of detection will find
 it.
 
+### Fully qualified domain names
+
+The certificate carries the hostname the kernel reports, which on many Linux systems is a short name such as
+`web01` rather than `web01.example.com`. **If clients connect by a fully qualified name, configure it
+explicitly:**
+
+```sh
+CERTD_EXTRA_SANS=web01.example.com
+```
+
+A host whose kernel hostname is already fully qualified needs nothing — that name is certified as it stands.
+
+`certd` does not try to work the FQDN out for itself. On Linux the kernel stores only the hostname, and the
+fully qualified form is a matter of convention: it may come from an `/etc/hosts` entry, from a DNS search
+domain, from a reverse lookup, or from nowhere at all. Every way of deriving it depends on configuration that
+can be absent, disagree with the others, or change while `certd` is running. A name derived that way would also
+change the certificate's SANs when it changed, re-issuing the certificate and restarting every dependent
+service — and unlike a stale IP SAN, a wrong name is the one clients check, so getting it wrong breaks TLS
+rather than merely adding something unused.
+
 Names and addresses are deduplicated and sorted, so two certificates issued from the same configuration list
 their SANs identically. Combined with `CERTD_INTERNAL_IP=false` and `CERTD_EXTERNAL_IP=false`, this gives
 certificates whose contents are entirely determined by configuration, with no detection at all.
