@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -167,6 +168,8 @@ type config struct {
 	notifyDir    string
 	internalIP   bool
 	interfaces   []string
+	extraIPs     []net.IP
+	extraDNS     []string
 	externalIP   bool
 	pollInterval time.Duration
 	maxRetries   int
@@ -286,6 +289,7 @@ func run(ctx context.Context, cfg *config, logger *slog.Logger) error {
 		"notifyDir", cfg.notifyDir,
 		"internalIP", cfg.internalIP,
 		"interfaces", interfaceSelectionText(cfg.interfaces),
+		"extraSANs", strings.Join(append(ipAddressesToStrings(cfg.extraIPs), cfg.extraDNS...), ","),
 		"externalIP", cfg.externalIP,
 		"pollInterval", cfg.pollInterval,
 		"maxRetries", cfg.maxRetries,
@@ -545,7 +549,7 @@ func checkOne(
 	// that one answer, so the two can never disagree about what belongs in the
 	// certificate.
 	resolveIPs := func() []net.IP {
-		return issuanceIPAddresses(logger, paths.cert, d, previousInternalIPs)
+		return issuanceIPAddresses(logger, paths.cert, d, previousInternalIPs, cfg.extraIPs)
 	}
 
 	issueAndNotify := func(reason string, ipAddresses []net.IP) error {
@@ -580,10 +584,19 @@ func checkOne(
 	// Update store with current cert state
 	store.setOK(alg, cert)
 
-	// Case: hostname changed (or cert does not include current hostname)
-	if cert.Subject.CommonName != hostname || !stringSliceContains(cert.DNSNames, hostname) {
+	// Case: hostname changed
+	if cert.Subject.CommonName != hostname {
 		logger.Info("hostname changed", "old", cert.Subject.CommonName, "new", hostname)
 		return issueAndNotify("hostname changed", resolveIPs())
+	}
+
+	// Case: DNS SANs differ from what this host would be issued now. Comparing
+	// the whole set rather than only checking that the hostname appears is what
+	// makes a change to the configured names take effect; a containment check
+	// would never notice one being added or removed.
+	if desiredDNS := certificateDNSNames(hostname, cfg.extraDNS); !stringSetsEqual(cert.DNSNames, desiredDNS) {
+		logger.Info("certificate DNS SANs changed", "old", cert.DNSNames, "new", desiredDNS)
+		return issueAndNotify("DNS SANs changed", resolveIPs())
 	}
 
 	// Case: IP SANs differ from what this host would be issued now. Comparing
@@ -704,7 +717,7 @@ func generateCert(alg algorithm, cfg *config, hostname string, ipAddresses []net
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject:      pkix.Name{CommonName: hostname},
-		DNSNames:     []string{hostname, "localhost"},
+		DNSNames:     certificateDNSNames(hostname, cfg.extraDNS),
 		IPAddresses:  ipAddresses,
 		NotBefore:    notBefore,
 		NotAfter:     notBefore.Add(cfg.lifetime),
@@ -770,6 +783,61 @@ func generateEd25519(template *x509.Certificate) ([]byte, []byte, error) {
 		return nil, nil, fmt.Errorf("marshaling Ed25519 key: %w", err)
 	}
 	return certDER, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), nil
+}
+
+// numericSAN matches an entry made only of the characters an IP address uses.
+// One that fails to parse is a mistyped address rather than a host name, and is
+// rejected instead of being quietly certified as a DNS name.
+var numericSAN = regexp.MustCompile(`^[0-9.:]+$`)
+
+// classifyExtraSANs splits configured subject alternative names into addresses
+// and host names. An entry that parses as an IP becomes an IP SAN; anything
+// else must be a syntactically valid DNS name.
+func classifyExtraSANs(entries []string) ([]net.IP, []string, error) {
+	var ips []net.IP
+	var names []string
+	for _, entry := range entries {
+		if ip := net.ParseIP(entry); ip != nil {
+			ips = append(ips, ip)
+			continue
+		}
+		if numericSAN.MatchString(entry) {
+			return nil, nil, fmt.Errorf("%q is not a valid IP address", entry)
+		}
+		if !validDNSName(entry) {
+			return nil, nil, fmt.Errorf("%q is not a valid IP address or DNS name", entry)
+		}
+		names = append(names, entry)
+	}
+	return ips, names, nil
+}
+
+// validDNSName reports whether a name can be used as a DNS subject alternative
+// name. A leading "*." is accepted, since a wildcard covers the leftmost label.
+func validDNSName(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	name = strings.TrimSuffix(name, ".")
+	if rest, found := strings.CutPrefix(name, "*."); found {
+		name = rest
+	}
+	if name == "" {
+		return false
+	}
+	for label := range strings.SplitSeq(name, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // addressIP extracts the IP from an interface address, or nil if it carries none.
@@ -1210,7 +1278,15 @@ func updateState(st *certState, hostname string, d addressDiscovery) {
 	}
 }
 
-func certificateIPAddresses(internalIPs []string, externalIP string) []net.IP {
+// certificateIPAddresses returns the IP SANs for a certificate: the loopback
+// address, whatever discovery found, and the addresses configured explicitly.
+// The result is deduplicated and ordered, so two certificates built from the
+// same inputs are byte-identical in this respect and can be compared by eye.
+//
+// Configured addresses are included whether or not this host holds them. That
+// is the point of them: a floating address belongs in the certificates of every
+// node that might take it over, not only the one holding it at issuance.
+func certificateIPAddresses(internalIPs []string, externalIP string, extra []net.IP) []net.IP {
 	candidates := make([]string, 0, 1+len(internalIPs)+1)
 	candidates = append(candidates, "127.0.0.1")
 	candidates = append(candidates, internalIPs...)
@@ -1218,21 +1294,76 @@ func certificateIPAddresses(internalIPs []string, externalIP string) []net.IP {
 		candidates = append(candidates, externalIP)
 	}
 
-	seen := make(map[string]struct{}, len(candidates))
-	ips := make([]net.IP, 0, len(candidates))
-	for _, candidate := range candidates {
-		ip := net.ParseIP(candidate)
+	seen := make(map[string]struct{}, len(candidates)+len(extra))
+	ips := make([]net.IP, 0, len(candidates)+len(extra))
+	add := func(ip net.IP) {
 		if ip == nil {
-			continue
+			return
 		}
 		canonical := ip.String()
 		if _, exists := seen[canonical]; exists {
-			continue
+			return
 		}
 		seen[canonical] = struct{}{}
 		ips = append(ips, ip)
 	}
+	for _, candidate := range candidates {
+		add(net.ParseIP(candidate))
+	}
+	for _, ip := range extra {
+		add(ip)
+	}
+
+	slices.SortFunc(ips, func(a, b net.IP) int { return bytes.Compare(a.To16(), b.To16()) })
 	return ips
+}
+
+// certificateDNSNames returns the DNS SANs for a certificate, deduplicated and
+// ordered for the same reason as the addresses.
+func certificateDNSNames(hostname string, extra []string) []string {
+	names := make([]string, 0, 2+len(extra))
+	seen := make(map[string]struct{}, 2+len(extra))
+	for _, name := range append([]string{hostname, "localhost"}, extra...) {
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// stringSetsEqual reports whether two lists hold the same entries, ignoring
+// order and repetition.
+func stringSetsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		aSet := make(map[string]struct{}, len(a))
+		for _, v := range a {
+			aSet[v] = struct{}{}
+		}
+		bSet := make(map[string]struct{}, len(b))
+		for _, v := range b {
+			bSet[v] = struct{}{}
+		}
+		if len(aSet) != len(bSet) {
+			return false
+		}
+		for v := range aSet {
+			if _, ok := bSet[v]; !ok {
+				return false
+			}
+		}
+		return true
+	}
+	sortedA := slices.Clone(a)
+	sortedB := slices.Clone(b)
+	slices.Sort(sortedA)
+	slices.Sort(sortedB)
+	return slices.Equal(sortedA, sortedB)
 }
 
 // issuanceIPAddresses returns the IP SANs to embed in a certificate that is
@@ -1248,8 +1379,9 @@ func issuanceIPAddresses(
 	certPath string,
 	d addressDiscovery,
 	previousInternalIPs []string,
+	extra []net.IP,
 ) []net.IP {
-	discovered := certificateIPAddresses(d.internalIPs, d.externalIP)
+	discovered := certificateIPAddresses(d.internalIPs, d.externalIP, extra)
 	if d.complete() {
 		return discovered
 	}
@@ -1352,15 +1484,6 @@ func ipAddressesToStrings(ips []net.IP) []string {
 		values[i] = ip.String()
 	}
 	return values
-}
-
-func stringSliceContains(values []string, needle string) bool {
-	for _, v := range values {
-		if v == needle {
-			return true
-		}
-	}
-	return false
 }
 
 func printVersion() {
@@ -1716,6 +1839,10 @@ func parseConfig() *config {
 		"Directory for per-algorithm notification files (env: CERTD_NOTIFY_DIR)")
 	flag.BoolVar(&cfg.internalIP, "internal-ip", envBoolOrDefault("CERTD_INTERNAL_IP", defaultInternalIP),
 		"Include internal IPs in certificate SANs (env: CERTD_INTERNAL_IP)")
+	var extraSANsStr string
+	flag.StringVar(&extraSANsStr, "extra-sans", envOrDefault("CERTD_EXTRA_SANS", ""),
+		"Additional subject alternative names, comma separated: IP addresses or DNS names, "+
+			"always certified whether or not this host holds them (env: CERTD_EXTRA_SANS)")
 	var interfacesStr string
 	flag.StringVar(&interfacesStr, "interfaces", envOrDefault("CERTD_INTERFACES", ""),
 		`Interfaces to take internal IPs from: "`+interfacesDefaultRoute+`" (the default), "`+interfacesAll+
@@ -1759,6 +1886,13 @@ func parseConfig() *config {
 	}
 
 	cfg.interfaces = splitList(interfacesStr)
+
+	extraIPs, extraDNS, err := classifyExtraSANs(splitList(extraSANsStr))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid -extra-sans value %q: %v\n", extraSANsStr, err)
+		os.Exit(1)
+	}
+	cfg.extraIPs, cfg.extraDNS = extraIPs, extraDNS
 
 	// Build algorithm list — default to ECDSA if none specified
 	if useRSA {

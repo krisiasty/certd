@@ -71,6 +71,7 @@ Environment=CERTD_EXTERNAL_IP=false
 | `CERTD_INTERNAL_IP`    | `-internal-ip`    | `false`               | Include non-loopback IPv4 addresses of local interfaces in certificate SANs                                      |
 | `CERTD_INTERFACES`     | `-interfaces`     | `default-route`       | Interfaces to take internal IPs from: `default-route`, `all`, or a list of interface names                       |
 | `CERTD_EXTERNAL_IP`    | `-external-ip`    | `false`               | Detect and include the external (NAT) IPv4 address in certificate SANs                                           |
+| `CERTD_EXTRA_SANS`     | `-extra-sans`     | —                     | Extra subject alternative names, comma separated: IP addresses or DNS names, always certified                    |
 | `CERTD_POLL_INTERVAL`  | `-poll-interval`  | `1h`                  | How often to check for hostname/IP changes and certificate expiry                                                |
 | `CERTD_MAX_RETRIES`    | `-max-retries`    | `5`                   | Maximum number of retries for external IP detection, with exponential backoff                                    |
 | `CERTD_HTTP_ADDR`      | `-http-addr`      | `127.0.0.1:8484`      | Address for the HTTP health and metrics server. Set to empty string to disable                                   |
@@ -195,6 +196,30 @@ while an address a working source contradicts is still removed.
 An address that enumeration no longer reports is therefore dropped even while external detection is failing,
 and an interface change is still acted on by a host with no internet access at all.
 The set is reconciled on the next poll with complete discovery.
+
+### Additional names and addresses
+
+`CERTD_EXTRA_SANS` adds subject alternative names that are always certified, whether or not this host holds
+them. Entries that parse as IP addresses become IP SANs and the rest become DNS SANs; anything that is neither
+is rejected at startup, so a mistyped address is not quietly certified as a host name.
+
+```sh
+CERTD_EXTRA_SANS=10.0.0.100,vip.example.com,*.apps.example.com
+```
+
+This is how to certify a floating address. A VRRP or Pacemaker VIP exists only on the node currently holding it,
+so detection would place it in that node's certificate alone — and at failover the node taking over would serve
+a certificate that is not valid for the address clients are connecting to, until its next poll re-issued the
+certificate and restarted the service. Configuring the address instead puts it in every node's certificate
+permanently, so a failover changes nothing and triggers no re-issue on either node.
+
+It is also the only way to certify an address the host cannot see at all. An AWS Elastic IP or an OpenStack
+floating IP is translated by the network and never appears on an interface, so no amount of detection will find
+it.
+
+Names and addresses are deduplicated and sorted, so two certificates issued from the same configuration list
+their SANs identically. Combined with `CERTD_INTERNAL_IP=false` and `CERTD_EXTERNAL_IP=false`, this gives
+certificates whose contents are entirely determined by configuration, with no detection at all.
 
 ## Integrating dependent services
 
