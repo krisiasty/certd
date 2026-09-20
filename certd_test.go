@@ -98,6 +98,20 @@ func TestRunRejectsInvalidConfigBeforeSideEffects(t *testing.T) {
 			wantError: "combines",
 		},
 		{
+			name: "interface selection mixes default-route with names",
+			configure: func(cfg *config) {
+				cfg.interfaces = []string{interfacesDefaultRoute, "eth0"}
+			},
+			wantError: "combines",
+		},
+		{
+			name: "interface selection combines both keywords",
+			configure: func(cfg *config) {
+				cfg.interfaces = []string{interfacesAll, interfacesDefaultRoute}
+			},
+			wantError: "combines",
+		},
+		{
 			name: "more retries than permitted",
 			configure: func(cfg *config) {
 				cfg.externalIP = true
@@ -1198,6 +1212,23 @@ func TestGetInternalIPsSelectionNarrowsTheResult(t *testing.T) {
 	for _, ip := range viaDefaultRoute {
 		if !stringSliceContains(all, ip) {
 			t.Fatalf("default route produced %s, which is not among %v", ip, all)
+		}
+	}
+
+	// Naming the default route explicitly must mean the same as leaving the
+	// setting empty, not "an interface called default-route".
+	named, err := getInternalIPs(t.Context(), []string{interfacesDefaultRoute}, logger)
+	if err != nil {
+		t.Fatalf("naming the default route: %v", err)
+	}
+	if len(named) != len(viaDefaultRoute) {
+		t.Fatalf("%q produced %v, want the same as an empty selection, %v",
+			interfacesDefaultRoute, named, viaDefaultRoute)
+	}
+	for i := range named {
+		if named[i] != viaDefaultRoute[i] {
+			t.Fatalf("%q produced %v, want the same as an empty selection, %v",
+				interfacesDefaultRoute, named, viaDefaultRoute)
 		}
 	}
 

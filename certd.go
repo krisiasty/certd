@@ -216,8 +216,11 @@ const (
 	maxBackoff = 16 * time.Second
 
 	// interfacesAll selects every non-loopback interface, which is what certd
-	// did before it learned to follow the default route.
-	interfacesAll = "all"
+	// did before it learned to follow the default route. interfacesDefaultRoute
+	// names the default behaviour, so a unit file can state which it relies on
+	// rather than leaving the setting empty and implying it.
+	interfacesAll          = "all"
+	interfacesDefaultRoute = "default-route"
 
 	// defaultRouteProbe is in TEST-NET-1 (RFC 5737), reserved for documentation
 	// and never routed anywhere. Connecting a UDP socket to it transmits
@@ -391,11 +394,13 @@ func validateConfig(cfg *config) error {
 			time.Duration(float64(cfg.pollInterval)/renewThreshold).Round(time.Second),
 		)
 	}
-	if len(cfg.interfaces) > 1 && slices.Contains(cfg.interfaces, interfacesAll) {
-		return fmt.Errorf(
-			"interface selection %q combines %q with named interfaces; name the interfaces, or use %q alone",
-			strings.Join(cfg.interfaces, ","), interfacesAll, interfacesAll,
-		)
+	for _, keyword := range []string{interfacesAll, interfacesDefaultRoute} {
+		if len(cfg.interfaces) > 1 && slices.Contains(cfg.interfaces, keyword) {
+			return fmt.Errorf(
+				"interface selection %q combines %q with other entries; use %q on its own, or name interfaces",
+				strings.Join(cfg.interfaces, ","), keyword, keyword,
+			)
+		}
 	}
 	// Both retry bounds are conditional because cfg.maxRetries has exactly one
 	// consumer, getExternalIPWithRetry, and that is only reached when external
@@ -834,7 +839,7 @@ func selectedInterfaces(ctx context.Context, selection []string, logger *slog.Lo
 	if len(selection) == 1 && selection[0] == interfacesAll {
 		return nil
 	}
-	if len(selection) > 0 {
+	if !followsDefaultRoute(selection) {
 		set := make(map[string]struct{}, len(selection))
 		for _, name := range selection {
 			set[name] = struct{}{}
@@ -897,10 +902,17 @@ func getInternalIPs(ctx context.Context, selection []string, logger *slog.Logger
 	return ips, nil
 }
 
-// interfaceSelectionText describes an interface selection for logging.
+// followsDefaultRoute reports whether a selection asks for the interface that
+// carries the default route, either by naming it or by saying nothing at all.
+func followsDefaultRoute(selection []string) bool {
+	return len(selection) == 0 || (len(selection) == 1 && selection[0] == interfacesDefaultRoute)
+}
+
+// interfaceSelectionText describes an interface selection for logging, naming
+// the default behaviour rather than reporting it as an empty setting.
 func interfaceSelectionText(selection []string) string {
-	if len(selection) == 0 {
-		return "default route"
+	if followsDefaultRoute(selection) {
+		return interfacesDefaultRoute
 	}
 	return strings.Join(selection, ",")
 }
@@ -1706,8 +1718,8 @@ func parseConfig() *config {
 		"Include internal IPs in certificate SANs (env: CERTD_INTERNAL_IP)")
 	var interfacesStr string
 	flag.StringVar(&interfacesStr, "interfaces", envOrDefault("CERTD_INTERFACES", ""),
-		`Interfaces to take internal IPs from: a comma-separated list, "`+interfacesAll+
-			`" for every non-loopback interface, or empty to follow the default route (env: CERTD_INTERFACES)`)
+		`Interfaces to take internal IPs from: "`+interfacesDefaultRoute+`" (the default), "`+interfacesAll+
+			`" for every non-loopback interface, or a comma-separated list of names (env: CERTD_INTERFACES)`)
 	flag.BoolVar(&cfg.externalIP, "external-ip", envBoolOrDefault("CERTD_EXTERNAL_IP", defaultExternalIP),
 		"Include external IP in certificate SANs (env: CERTD_EXTERNAL_IP)")
 	flag.IntVar(&cfg.maxRetries, "max-retries", envIntOrDefault("CERTD_MAX_RETRIES", defaultMaxRetries),

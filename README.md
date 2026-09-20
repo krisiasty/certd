@@ -69,7 +69,7 @@ Environment=CERTD_EXTERNAL_IP=false
 | `CERTD_CERT_DIR`       | `-cert-dir`       | `/var/lib/certd`      | Directory where certificate and key files are written                                                            |
 | `CERTD_NOTIFY_DIR`     | `-notify-dir`     | `/run/certd`          | Directory where notification files are written after a certificate is issued or renewed                          |
 | `CERTD_INTERNAL_IP`    | `-internal-ip`    | `false`               | Include non-loopback IPv4 addresses of local interfaces in certificate SANs                                      |
-| `CERTD_INTERFACES`     | `-interfaces`     | default route         | Interfaces to take internal IPs from: names, `all`, or empty to follow the default route                         |
+| `CERTD_INTERFACES`     | `-interfaces`     | `default-route`       | Interfaces to take internal IPs from: `default-route`, `all`, or a list of interface names                       |
 | `CERTD_EXTERNAL_IP`    | `-external-ip`    | `false`               | Detect and include the external (NAT) IPv4 address in certificate SANs                                           |
 | `CERTD_POLL_INTERVAL`  | `-poll-interval`  | `1h`                  | How often to check for hostname/IP changes and certificate expiry                                                |
 | `CERTD_MAX_RETRIES`    | `-max-retries`    | `5`                   | Maximum number of retries for external IP detection, with exponential backoff                                    |
@@ -160,13 +160,13 @@ interface carrying the default route, which keeps container and virtual bridges 
 `virbr0` out of the certificate. Those appear and disappear as containers and networks are created and removed,
 and every change would re-issue the certificate and restart each dependent service.
 
-`CERTD_INTERFACES` selects where the addresses come from:
+`CERTD_INTERFACES` selects where the addresses come from, and defaults to `default-route`:
 
-| Value               | Meaning                                  |
-|---------------------|------------------------------------------|
-| empty (the default) | The interface carrying the default route |
-| `all`               | Every non-loopback interface             |
-| `eth0,eth1`         | Exactly the interfaces named             |
+| Value           | Meaning                                                                          |
+|-----------------|----------------------------------------------------------------------------------|
+| `default-route` | The interface carrying the default route. This is also what an empty value means |
+| `all`           | Every non-loopback interface                                                     |
+| `eth0,eth1`     | Exactly the interfaces named                                                     |
 
 A host that serves on more than one network needs `all` or an explicit list, or the addresses on its other
 networks are left out of the certificate.
