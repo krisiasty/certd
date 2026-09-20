@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -791,6 +792,90 @@ func TestCheckOneIssuesMissingCertificateDespiteIncompleteDiscovery(t *testing.T
 			ipAddressesToStrings(want),
 		)
 	}
+}
+
+func TestREADMEDocumentsActualDefaults(t *testing.T) {
+	t.Parallel()
+
+	documented := readREADMEDefaults(t)
+
+	literals := []struct {
+		env  string
+		want string
+	}{
+		{"CERTD_ECDSA", strconv.FormatBool(defaultECDSA)},
+		{"CERTD_ED25519", strconv.FormatBool(defaultEd25519)},
+		{"CERTD_RSA", strconv.FormatBool(defaultRSA)},
+		{"CERTD_CERT_DIR", defaultCertDir},
+		{"CERTD_NOTIFY_DIR", defaultNotifyDir},
+		{"CERTD_INTERNAL_IP", strconv.FormatBool(defaultInternalIP)},
+		{"CERTD_EXTERNAL_IP", strconv.FormatBool(defaultExternalIP)},
+		{"CERTD_MAX_RETRIES", strconv.Itoa(defaultMaxRetries)},
+		{"CERTD_HTTP_ADDR", defaultHTTPAddr},
+	}
+	for _, tt := range literals {
+		got, ok := documented[tt.env]
+		if !ok {
+			t.Errorf("%s has no row in the configuration reference", tt.env)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("%s documented default = %q, code default = %q", tt.env, got, tt.want)
+		}
+	}
+
+	// Durations are compared by value, so any equivalent spelling passes.
+	durations := []struct {
+		env  string
+		want time.Duration
+	}{
+		{"CERTD_LIFETIME", defaultLifetime},
+		{"CERTD_POLL_INTERVAL", defaultPollInterval},
+	}
+	for _, tt := range durations {
+		got, ok := documented[tt.env]
+		if !ok {
+			t.Errorf("%s has no row in the configuration reference", tt.env)
+			continue
+		}
+		parsed, err := parseDuration(got)
+		if err != nil {
+			t.Errorf("%s documented default %q does not parse: %v", tt.env, got, err)
+			continue
+		}
+		if parsed != tt.want {
+			t.Errorf("%s documented default = %q (%s), code default = %s", tt.env, got, parsed, tt.want)
+		}
+	}
+}
+
+// readREADMEDefaults returns the default documented for every CERTD_* variable
+// in the configuration reference table.
+func readREADMEDefaults(t *testing.T) map[string]string {
+	t.Helper()
+
+	data, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatalf("read README: %v", err)
+	}
+
+	defaults := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "| `CERTD_") {
+			continue
+		}
+		cells := strings.Split(strings.Trim(line, "|"), "|")
+		if len(cells) < 3 {
+			continue
+		}
+		name := strings.Trim(strings.TrimSpace(cells[0]), "`")
+		defaults[name] = strings.Trim(strings.TrimSpace(cells[2]), "`")
+	}
+	if len(defaults) == 0 {
+		t.Fatal("no CERTD_* rows found in the configuration reference table")
+	}
+	return defaults
 }
 
 func TestIPAddressSetsEqualIgnoresOrderAndDuplicates(t *testing.T) {

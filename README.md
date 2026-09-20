@@ -61,20 +61,25 @@ Environment=CERTD_EXTERNAL_IP=false
 
 | Environment variable   | CLI flag          | Default               | Description                                                                                                      |
 |------------------------|-------------------|-----------------------|------------------------------------------------------------------------------------------------------------------|
-| `CERTD_ECDSA`          | `-ecdsa`          | `true`                | Generate and manage an ECDSA P-256 certificate                                                                   |
+| `CERTD_ECDSA`          | `-ecdsa`          | `false`               | Generate and manage an ECDSA P-256 certificate                                                                   |
 | `CERTD_ED25519`        | `-ed25519`        | `false`               | Generate and manage an Ed25519 certificate                                                                       |
 | `CERTD_RSA`            | `-rsa`            | `false`               | Generate and manage an RSA 4096 certificate                                                                      |
 | `CERTD_LIFETIME`       | `-lifetime`       | `1y`                  | Certificate lifetime. Accepts `y`, `w`, `d`, `h`, `m`, `s` and combinations such as `1y30d` or `90d12h`          |
 | `CERTD_CERT_DIR`       | `-cert-dir`       | `/var/lib/certd`      | Directory where certificate and key files are written                                                            |
 | `CERTD_NOTIFY_DIR`     | `-notify-dir`     | `/run/certd`          | Directory where notification files are written after a certificate is issued or renewed                          |
-| `CERTD_INTERNAL_IP`    | `-internal-ip`    | `true`                | Include non-loopback IPv4 addresses of local interfaces in certificate SANs                                      |
-| `CERTD_EXTERNAL_IP`    | `-external-ip`    | `true`                | Detect and include the external (NAT) IPv4 address in certificate SANs                                           |
-| `CERTD_POLL_INTERVAL`  | `-poll-interval`  | `1d`                  | How often to check for hostname/IP changes and certificate expiry                                                |
+| `CERTD_INTERNAL_IP`    | `-internal-ip`    | `false`               | Include non-loopback IPv4 addresses of local interfaces in certificate SANs                                      |
+| `CERTD_EXTERNAL_IP`    | `-external-ip`    | `false`               | Detect and include the external (NAT) IPv4 address in certificate SANs                                           |
+| `CERTD_POLL_INTERVAL`  | `-poll-interval`  | `1h`                  | How often to check for hostname/IP changes and certificate expiry                                                |
 | `CERTD_MAX_RETRIES`    | `-max-retries`    | `5`                   | Maximum number of retries for external IP detection, with exponential backoff                                    |
 | `CERTD_HTTP_ADDR`      | `-http-addr`      | `127.0.0.1:8484`      | Address for the HTTP health and metrics server. Set to empty string to disable                                   |
-| `GOMAXPROCS`           | —                 | `1`                   | Number of OS threads used by the Go runtime. `certd` is I/O-bound and does not benefit from more than one thread |
+| `GOMAXPROCS`           | —                 | —                     | Number of OS threads used by the Go runtime. `certd` is I/O-bound and does not benefit from more than one thread |
 
-If none of `CERTD_ECDSA`, `CERTD_ED25519`, or `CERTD_RSA` are set, `certd` defaults to ECDSA.
+All three algorithm switches default to `false`. If none of them is enabled, `certd` falls back to a single
+ECDSA certificate — so enabling only `CERTD_RSA` yields RSA alone, not RSA alongside ECDSA.
+
+The table lists the defaults built into `certd`. The packaged systemd unit sets most of these explicitly, so a
+default installation runs with the unit's values rather than these; see [files/etc/systemd/system/certd.service](files/etc/systemd/system/certd.service).
+`GOMAXPROCS` has no `certd` default at all — the Go runtime uses the CPU count unless the unit pins it to `1`.
 
 ### CLI flags
 

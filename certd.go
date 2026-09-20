@@ -180,7 +180,16 @@ const (
 	defaultMaxRetries   = 5
 	defaultLifetime     = 8760 * time.Hour // 1 year
 	defaultHTTPAddr     = "127.0.0.1:8484"
-	renewThreshold      = 1.0 / 3.0 // renew when less than 1/3 of lifetime remains
+
+	// Every algorithm is off by default; parseConfig falls back to ECDSA when
+	// none was selected. Named alongside the rest so the documented defaults
+	// have a single source to be checked against.
+	defaultRSA        = false
+	defaultECDSA      = false
+	defaultEd25519    = false
+	defaultInternalIP = false
+	defaultExternalIP = false
+	renewThreshold    = 1.0 / 3.0 // renew when less than 1/3 of lifetime remains
 )
 
 var externalIPProviders = []string{
@@ -1432,11 +1441,11 @@ func parseConfig() *config {
 
 	var useRSA, useECDSA, useEd25519 bool
 
-	flag.BoolVar(&useRSA, "rsa", envBoolOrDefault("CERTD_RSA", false),
+	flag.BoolVar(&useRSA, "rsa", envBoolOrDefault("CERTD_RSA", defaultRSA),
 		"Generate and manage RSA 4096 certificate (env: CERTD_RSA)")
-	flag.BoolVar(&useECDSA, "ecdsa", envBoolOrDefault("CERTD_ECDSA", false),
+	flag.BoolVar(&useECDSA, "ecdsa", envBoolOrDefault("CERTD_ECDSA", defaultECDSA),
 		"Generate and manage ECDSA P-256 certificate (env: CERTD_ECDSA)")
-	flag.BoolVar(&useEd25519, "ed25519", envBoolOrDefault("CERTD_ED25519", false),
+	flag.BoolVar(&useEd25519, "ed25519", envBoolOrDefault("CERTD_ED25519", defaultEd25519),
 		"Generate and manage Ed25519 certificate (env: CERTD_ED25519)")
 
 	cfg := &config{}
@@ -1455,9 +1464,9 @@ func parseConfig() *config {
 		"Directory for certificate and key files (env: CERTD_CERT_DIR)")
 	flag.StringVar(&cfg.notifyDir, "notify-dir", envOrDefault("CERTD_NOTIFY_DIR", defaultNotifyDir),
 		"Directory for per-algorithm notification files (env: CERTD_NOTIFY_DIR)")
-	flag.BoolVar(&cfg.internalIP, "internal-ip", envBoolOrDefault("CERTD_INTERNAL_IP", false),
+	flag.BoolVar(&cfg.internalIP, "internal-ip", envBoolOrDefault("CERTD_INTERNAL_IP", defaultInternalIP),
 		"Include internal IPs in certificate SANs (env: CERTD_INTERNAL_IP)")
-	flag.BoolVar(&cfg.externalIP, "external-ip", envBoolOrDefault("CERTD_EXTERNAL_IP", false),
+	flag.BoolVar(&cfg.externalIP, "external-ip", envBoolOrDefault("CERTD_EXTERNAL_IP", defaultExternalIP),
 		"Include external IP in certificate SANs (env: CERTD_EXTERNAL_IP)")
 	flag.IntVar(&cfg.maxRetries, "max-retries", envIntOrDefault("CERTD_MAX_RETRIES", defaultMaxRetries),
 		"Max retries for external IP detection (env: CERTD_MAX_RETRIES)")
