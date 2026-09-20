@@ -1017,6 +1017,49 @@ func TestNeedsRenewal(t *testing.T) {
 	}
 }
 
+func TestBackoffStopsDoublingAtTheCap(t *testing.T) {
+	t.Parallel()
+
+	var got []time.Duration
+	backoff := time.Second
+	for range 8 {
+		got = append(got, backoff)
+		backoff = nextBackoff(backoff)
+	}
+
+	want := []time.Duration{
+		time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second,
+		16 * time.Second, 16 * time.Second, 16 * time.Second, 16 * time.Second,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("backoff schedule = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("backoff schedule = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestRetryBackoffStaysBoundedAtMaxRetries(t *testing.T) {
+	t.Parallel()
+
+	// Without a cap the delay doubles with every retry, so the retry count buys
+	// exponential time: at the permitted maximum the last sleep alone would run
+	// for days, and because the first check gates the systemd readiness
+	// notification, it would hold up startup for just as long.
+	var total time.Duration
+	backoff := time.Second
+	for range maxRetries {
+		total += backoff
+		backoff = nextBackoff(backoff)
+	}
+
+	if limit := 2 * time.Minute; total > limit {
+		t.Fatalf("worst-case backoff over %d retries = %s, want at most %s", maxRetries, total, limit)
+	}
+}
+
 func TestHumanDuration(t *testing.T) {
 	t.Parallel()
 

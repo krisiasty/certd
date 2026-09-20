@@ -203,6 +203,14 @@ const (
 	minRetries      = 1
 	maxRetries      = 10
 
+	// maxBackoff caps the delay between external IP attempts. Doubling without
+	// a ceiling makes each extra retry cost as much as every one before it put
+	// together, so the count buys exponential time rather than more attempts:
+	// at twenty retries the final sleep alone runs for six days. Capped, the
+	// same twenty retries cost four and a half minutes. The default of five
+	// never reaches the cap, so its schedule is unchanged.
+	maxBackoff = 16 * time.Second
+
 	defaultRSA        = false
 	defaultECDSA      = false
 	defaultEd25519    = false
@@ -755,6 +763,15 @@ func getInternalIPs() ([]string, error) {
 	return ips, nil
 }
 
+// nextBackoff returns the delay to wait after a failed attempt, doubling up to
+// maxBackoff and holding there.
+func nextBackoff(current time.Duration) time.Duration {
+	if next := current * 2; next < maxBackoff {
+		return next
+	}
+	return maxBackoff
+}
+
 // getExternalIPWithRetry fetches the external IP with exponential backoff.
 func getExternalIPWithRetry(ctx context.Context, maxRetries int, logger *slog.Logger) (string, error) {
 	backoff := time.Second
@@ -775,7 +792,7 @@ func getExternalIPWithRetry(ctx context.Context, maxRetries int, logger *slog.Lo
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-time.After(backoff):
-			backoff *= 2
+			backoff = nextBackoff(backoff)
 		}
 	}
 	return "", fmt.Errorf("all %d attempts failed, last error: %w", maxRetries, lastErr)
