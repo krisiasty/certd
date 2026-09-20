@@ -465,13 +465,14 @@ func checkOne(
 		return notify()
 	}
 
-	// Case 1: cert or key missing
+	// Case: cert or key missing
 	if !fileExists(paths.cert) || !fileExists(paths.key) {
 		return issueAndNotify("missing", resolveIPs())
 	}
 
-	// Parse the existing certificate and verify that its private key matches the
-	// certificate and the algorithm selected for this path.
+	// Case: invalid certificate/key pair. Parse the existing certificate and
+	// verify that its private key matches the certificate and the algorithm
+	// selected for this path.
 	cert, err := loadCertificateKeyPair(paths, alg)
 	if err != nil {
 		logger.Warn("existing certificate/key pair is invalid, re-issuing", "err", err)
@@ -481,13 +482,13 @@ func checkOne(
 	// Update store with current cert state
 	store.setOK(alg, cert)
 
-	// Case 2: hostname changed (or cert does not include current hostname)
+	// Case: hostname changed (or cert does not include current hostname)
 	if cert.Subject.CommonName != hostname || !stringSliceContains(cert.DNSNames, hostname) {
 		logger.Info("hostname changed", "old", cert.Subject.CommonName, "new", hostname)
 		return issueAndNotify("hostname changed", resolveIPs())
 	}
 
-	// Case 3: IP SANs differ from what this host would be issued now. Comparing
+	// Case: IP SANs differ from what this host would be issued now. Comparing
 	// against the resolved issuance set rather than against raw discovery results
 	// means a source that did answer is still acted on when the other did not:
 	// interface enumeration is a local syscall that all but always succeeds,
@@ -506,7 +507,7 @@ func checkOne(
 		return issueAndNotify("IP SANs changed", issueIPs)
 	}
 
-	// Case 4: renewal due
+	// Case: renewal due
 	if needsRenewal(cert, renewThreshold) {
 		logger.Info("certificate approaching expiry",
 			"notAfter", cert.NotAfter,
