@@ -104,6 +104,14 @@ The table lists the defaults built into `certd`. The packaged systemd unit sets 
 default installation runs with the unit's values rather than these; see [files/etc/systemd/system/certd.service](files/etc/systemd/system/certd.service).
 `GOMAXPROCS` has no `certd` default at all — the Go runtime uses the CPU count unless the unit pins it to `1`.
 
+All settings are read once at startup. A value that cannot be understood is rejected and `certd` refuses to
+start, reporting every unusable variable at once so the configuration can be fixed in one pass rather than one
+restart per mistake.
+
+Booleans accept `true` or `false`, in any case, and nothing else. `yes`, `on` and `1` are errors rather than
+being read as `false`. Numbers must be whole and complete, so `3.9` and `5x` are rejected rather than read as
+`3` and `5`.
+
 Each setting is bounded at both ends, and a value outside its range is rejected at startup:
 
 | Setting               | Range         |
